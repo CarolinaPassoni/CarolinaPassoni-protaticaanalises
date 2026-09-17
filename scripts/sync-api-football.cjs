@@ -1,4 +1,4 @@
-/* ProTática V6.5 — API-Football + validação rígida de vídeo
+/* ProTática V6.6 — API-Football + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -17,7 +17,7 @@ const TURSO_URL = String(process.env.TURSO_DATABASE_URL || '').trim();
 const TURSO_TOKEN = String(process.env.TURSO_AUTH_TOKEN || '').trim();
 const TZ = 'America/Sao_Paulo';
 const production = process.env.NODE_ENV === 'production';
-const SYNC_VERSION = '6.5';
+const SYNC_VERSION = '6.6';
 
 if (!production) {
   console.log('[API_FOOTBALL] Ambiente local: sincronização automática ignorada.');
@@ -364,8 +364,13 @@ async function main() {
     const round = String(f.league?.round || '');
     const stadium = String(f.fixture?.venue?.name || '');
     const city = String(f.fixture?.venue?.city || '');
-    const scoreHome = Number.isFinite(Number(f.goals?.home)) ? Number(f.goals.home) : null;
-    const scoreAway = Number.isFinite(Number(f.goals?.away)) ? Number(f.goals.away) : null;
+    const nullableScore = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const scoreHome = nullableScore(f.goals?.home);
+    const scoreAway = nullableScore(f.goals?.away);
 
     db.prepare(`
       INSERT INTO matches (
