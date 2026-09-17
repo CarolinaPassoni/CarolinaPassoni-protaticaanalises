@@ -1,8 +1,7 @@
-/* ProTática V5 — trava de integridade de partidas
+/* ProTática V6.4 — integridade compatível com API-Football
  *
- * Executa antes do servidor no Render.
- * Objetivo: nunca apresentar fixture demonstrativo ou URL velha de vídeo
- * como se fosse fonte de uma partida atual.
+ * Mantém as travas contra fixtures demonstrativos/URLs antigas, mas NÃO
+ * remove destaques de partidas oficiais sincronizadas pela API-Football.
  */
 const LibSQLModule = require('libsql');
 const Database = LibSQLModule.default || LibSQLModule;
@@ -34,7 +33,9 @@ try {
     );
   `);
 
-  // Fixtures originalmente embutidos no código. Em produção eles NÃO são dados reais.
+  const matchCols = db.prepare(`PRAGMA table_info(matches)`).all();
+  const hasSourceProvider = matchCols.some(c => c.name === 'source_provider');
+
   const demoMatchIds = [
     'match_fla_pal',
     'match_rma_mci',
@@ -45,8 +46,6 @@ try {
 
   const placeholders = demoMatchIds.map(() => '?').join(',');
 
-  // V5 é mais rígido que V4: uma URL antiga adicionada ao demo não o transforma
-  // em partida real. Preservamos somente se já houver análise vinculada.
   const demos = db.prepare(`
     SELECT id, home_team, away_team, match_date, video_url, status
     FROM matches
@@ -77,14 +76,14 @@ try {
       AND analysis_id IS NULL
   `).run(...demoMatchIds);
 
-  // Partida agendada ou ao vivo não pode manter URL de "fonte final".
-  // Isso elimina links de jogos antigos reaproveitados indevidamente.
+  // Partidas ainda não finalizadas não podem manter uma URL de vídeo final
+  // sem análise vinculada. Vale inclusive para dados oficiais.
   const pendingWithUrls = db.prepare(`
     SELECT id, home_team, away_team, match_date, status, video_url
     FROM matches
     WHERE analysis_id IS NULL
       AND COALESCE(video_url, '') <> ''
-      AND LOWER(COALESCE(status, 'scheduled')) <> 'finished'
+      AND LOWER(COALESCE(status, 'scheduled')) NOT IN ('finished', 'finished_waiting_video')
   `).all();
 
   for (const m of pendingWithUrls) {
@@ -110,24 +109,41 @@ try {
            updated_at = CURRENT_TIMESTAMP
      WHERE analysis_id IS NULL
        AND COALESCE(video_url, '') <> ''
-       AND LOWER(COALESCE(status, 'scheduled')) <> 'finished'
+       AND LOWER(COALESCE(status, 'scheduled')) NOT IN ('finished', 'finished_waiting_video')
   `).run();
 
-  // Uma partida agendada sem fonte verificada não deve ser destaque "analisável".
-  const unfeatureResult = db.prepare(`
-    UPDATE matches
-       SET is_featured = 0,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE analysis_id IS NULL
-       AND LOWER(COALESCE(status, 'scheduled')) <> 'finished'
-       AND COALESCE(video_url, '') = ''
-  `).run();
+  // Só retiramos dos destaques fixtures manuais/não verificadas.
+  // Partidas vindas de api_football podem estar agendadas e devem continuar
+  // aparecendo como partidas oficiais, apenas sem botão de análise.
+  let unfeatureResult;
+  if (hasSourceProvider) {
+    unfeatureResult = db.prepare(`
+      UPDATE matches
+         SET is_featured = 0,
+             updated_at = CURRENT_TIMESTAMP
+       WHERE analysis_id IS NULL
+         AND COALESCE(source_provider, '') <> 'api_football'
+         AND LOWER(COALESCE(status, 'scheduled')) NOT IN ('finished', 'finished_waiting_video')
+         AND COALESCE(video_url, '') = ''
+    `).run();
+  } else {
+    unfeatureResult = db.prepare(`
+      UPDATE matches
+         SET is_featured = 0,
+             updated_at = CURRENT_TIMESTAMP
+       WHERE analysis_id IS NULL
+         AND LOWER(COALESCE(status, 'scheduled')) NOT IN ('finished', 'finished_waiting_video')
+         AND COALESCE(video_url, '') = ''
+    `).run();
+  }
 
   console.log(
     `[MATCH_INTEGRITY] OK: demos removidos=${Number(deleteResult?.changes || 0)}, ` +
     `URLs inválidas limpas=${Number(clearResult?.changes || 0)}, ` +
-    `pendentes removidos dos destaques=${Number(unfeatureResult?.changes || 0)}.`
+    `pendentes manuais removidos dos destaques=${Number(unfeatureResult?.changes || 0)}.`
   );
+
+  process.exit(0);
 } catch (err) {
   console.error('[MATCH_INTEGRITY] Falha na validação de integridade:', err);
   process.exit(1);

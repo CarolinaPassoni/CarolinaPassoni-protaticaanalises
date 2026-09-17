@@ -1,4 +1,4 @@
-/* ProTática V6.3 — API-Football + validação rígida de vídeo
+/* ProTática V6.4 — API-Football + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -17,6 +17,7 @@ const TURSO_URL = String(process.env.TURSO_DATABASE_URL || '').trim();
 const TURSO_TOKEN = String(process.env.TURSO_AUTH_TOKEN || '').trim();
 const TZ = 'America/Sao_Paulo';
 const production = process.env.NODE_ENV === 'production';
+const SYNC_VERSION = '6.4';
 
 if (!production) {
   console.log('[API_FOOTBALL] Ambiente local: sincronização automática ignorada.');
@@ -240,9 +241,17 @@ async function main() {
   try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_fixture ON matches(external_fixture_id);'); } catch {}
 
   const lastSync = settingGet('api_football_last_sync_at');
-  if (lastSync && Date.now() - parseTs(lastSync) < 50 * 60 * 1000) {
+  const previousSyncVersion = settingGet('api_football_sync_schema_version');
+  const cacheFresh = lastSync && Date.now() - parseTs(lastSync) < 50 * 60 * 1000;
+
+  // Mudanças nas regras de seleção/limpeza precisam de uma sincronização real
+  // mesmo que o cache horário ainda esteja válido.
+  if (cacheFresh && previousSyncVersion === SYNC_VERSION) {
     console.log('[API_FOOTBALL] Cache válido; nova chamada não é necessária.');
     return;
+  }
+  if (cacheFresh && previousSyncVersion !== SYNC_VERSION) {
+    console.log(`[API_FOOTBALL] Cache ignorado para migração de sincronização ${previousSyncVersion || 'legado'} -> ${SYNC_VERSION}.`);
   }
 
   const localToday = today();
@@ -281,6 +290,18 @@ async function main() {
   const rows = Array.from(rowsByFixture.values());
   const selected = rows.filter(f => compFor(f.league));
   console.log(`[API_FOOTBALL] Requests=${requestCount}; recebidos=${rows.length}; competições monitoradas=${selected.length}; quota restante=${remaining ?? 'n/d'}.`);
+
+  // Limpa registros importados pela regra antiga dentro da janela Free.
+  // Análises já vinculadas são sempre preservadas.
+  const cleanupDates = datesToFetch;
+  const cleanupPlaceholders = cleanupDates.map(() => '?').join(',');
+  const staleResult = db.prepare(`
+    DELETE FROM matches
+     WHERE source_provider = 'api_football'
+       AND analysis_id IS NULL
+       AND substr(COALESCE(kickoff_at, ''), 1, 10) IN (${cleanupPlaceholders})
+  `).run(...cleanupDates);
+  console.log(`[API_FOOTBALL] Limpeza pré-sync: ${Number(staleResult?.changes || 0)} registros API sem análise removidos da janela atual.`);
 
   // Limpa destaques de dados API; serão recalculados com base em hoje.
   db.prepare(`UPDATE matches SET is_featured = 0 WHERE source_provider = 'api_football'`).run();
@@ -401,7 +422,8 @@ async function main() {
   settingSet('api_football_last_sync_at', nowIso());
   if (!fullSyncToday) settingSet('api_football_last_full_sync_date', localToday);
   if (remaining != null) settingSet('api_football_last_remaining_quota', remaining);
-  console.log(`[API_FOOTBALL] OK: partidas atualizadas=${insertedOrUpdated}; vídeos validados=${verifiedVideos}; buscas de vídeo=${lookups}.`);
+  settingSet('api_football_sync_schema_version', SYNC_VERSION);
+  console.log(`[API_FOOTBALL] OK: partidas atualizadas=${insertedOrUpdated}; vídeos validados=${verifiedVideos}; buscas de vídeo=${lookups}; versão=${SYNC_VERSION}.`);
 }
 
 main()
