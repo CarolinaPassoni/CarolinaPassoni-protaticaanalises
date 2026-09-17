@@ -14,7 +14,7 @@ const runBlocking = (script) => {
 
 // 1) limpa fixtures demonstrativos / URLs antigas
 runBlocking('scripts/validate-match-integrity.cjs');
-// 2) sincroniza a fonte oficial de partidas (com cache de quota)
+// 2) sincroniza a fonte oficial de partidas (com cache e proteção de quota)
 runBlocking('scripts/sync-api-football.cjs');
 
 // 3) inicia o servidor principal
@@ -35,8 +35,10 @@ const periodicSync = () => {
   child.on('error', () => { syncRunning = false; });
 };
 
-// Uma chamada por hora no máximo. O próprio script ainda aplica cooldown no Turso.
-const timer = setInterval(periodicSync, 60 * 60 * 1000);
+// V6.8: a cada 30 minutos. O sincronizador usa cooldown de 25 min e quota guard.
+// Em um dia inteiro, o consumo típico máximo fica perto de 50 chamadas,
+// ainda abaixo do limite Free de 100/dia.
+const timer = setInterval(periodicSync, 30 * 60 * 1000);
 timer.unref();
 
 const shutdown = (signal) => {

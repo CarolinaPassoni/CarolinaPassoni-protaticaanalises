@@ -1,4 +1,4 @@
-/* ProTática V6.6 — API-Football + validação rígida de vídeo
+/* ProTática V6.8 — ciclo automático pós-jogo + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -17,7 +17,7 @@ const TURSO_URL = String(process.env.TURSO_DATABASE_URL || '').trim();
 const TURSO_TOKEN = String(process.env.TURSO_AUTH_TOKEN || '').trim();
 const TZ = 'America/Sao_Paulo';
 const production = process.env.NODE_ENV === 'production';
-const SYNC_VERSION = '6.6';
+const SYNC_VERSION = '6.8';
 
 if (!production) {
   console.log('[API_FOOTBALL] Ambiente local: sincronização automática ignorada.');
@@ -210,6 +210,19 @@ const findVerifiedVideo = async (fixture) => {
   return best;
 };
 
+const videoRetryIntervalMs = (fixture) => {
+  const kickoffMs = Date.parse(String(fixture?.fixture?.date || ''));
+  if (!Number.isFinite(kickoffMs)) return 60 * 60 * 1000;
+
+  const elapsed = Math.max(0, Date.now() - kickoffMs);
+  // Logo após o jogo, highlights costumam surgir rapidamente.
+  if (elapsed <= 6 * 60 * 60 * 1000) return 30 * 60 * 1000;
+  // Durante o primeiro dia, reduzimos a frequência.
+  if (elapsed <= 24 * 60 * 60 * 1000) return 90 * 60 * 1000;
+  // Depois disso, ainda tentamos por até 3 dias, mas sem excesso.
+  return 6 * 60 * 60 * 1000;
+};
+
 const apiFetch = async (params) => {
   const u = new URL(`${BASE_URL}/fixtures`);
   for (const [k,v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
@@ -242,7 +255,7 @@ async function main() {
 
   const lastSync = settingGet('api_football_last_sync_at');
   const previousSyncVersion = settingGet('api_football_sync_schema_version');
-  const cacheFresh = lastSync && Date.now() - parseTs(lastSync) < 50 * 60 * 1000;
+  const cacheFresh = lastSync && Date.now() - parseTs(lastSync) < 25 * 60 * 1000;
   const isSyncMigration = previousSyncVersion !== SYNC_VERSION;
 
   // Mudanças nas regras de seleção/limpeza precisam de uma sincronização real
@@ -256,6 +269,16 @@ async function main() {
   }
 
   const localToday = today();
+
+  // Proteção extra do plano Free. Em operação normal o V6.8 consome cerca de
+  // 50 chamadas/dia no máximo (3 na carga diária + ~1 a cada 30 min).
+  const quotaDate = settingGet('api_football_last_quota_date');
+  const quotaRemainingStored = Number(settingGet('api_football_last_remaining_quota') || '999');
+  if (!isSyncMigration && quotaDate === localToday && Number.isFinite(quotaRemainingStored) && quotaRemainingStored <= 8) {
+    console.warn(`[API_FOOTBALL] Quota protegida: restam ${quotaRemainingStored} chamadas. Sincronização adiada.`);
+    return;
+  }
+
   const fullSyncToday = settingGet('api_football_last_full_sync_date') === localToday;
 
   // Em uma migração de regra, revalidamos obrigatoriamente ontem/hoje/amanhã,
@@ -293,17 +316,29 @@ async function main() {
   const selected = rows.filter(f => compFor(f.league));
   console.log(`[API_FOOTBALL] Requests=${requestCount}; recebidos=${rows.length}; competições monitoradas=${selected.length}; quota restante=${remaining ?? 'n/d'}.`);
 
-  // Limpa registros importados pela regra antiga dentro da janela Free.
-  // Análises já vinculadas são sempre preservadas.
+  // Remove somente fixtures que deixaram de existir/ser monitoradas dentro da
+  // janela consultada. Não apagamos todas as partidas antes do upsert, pois isso
+  // preserva vídeo validado, histórico de tentativas e metadados entre ciclos.
   const cleanupDates = datesToFetch;
   const cleanupPlaceholders = cleanupDates.map(() => '?').join(',');
-  const staleResult = db.prepare(`
-    DELETE FROM matches
-     WHERE source_provider = 'api_football'
-       AND analysis_id IS NULL
-       AND substr(COALESCE(kickoff_at, ''), 1, 10) IN (${cleanupPlaceholders})
-  `).run(...cleanupDates);
-  console.log(`[API_FOOTBALL] Limpeza pré-sync: ${Number(staleResult?.changes || 0)} registros API sem análise removidos da janela atual.`);
+  const selectedIds = selected
+    .map(f => Number(f?.fixture?.id))
+    .filter(Number.isFinite)
+    .map(id => `api_fixture_${id}`);
+
+  let staleChanges = 0;
+  if (selectedIds.length > 0) {
+    const selectedPlaceholders = selectedIds.map(() => '?').join(',');
+    const staleResult = db.prepare(`
+      DELETE FROM matches
+       WHERE source_provider = 'api_football'
+         AND analysis_id IS NULL
+         AND substr(COALESCE(kickoff_at, ''), 1, 10) IN (${cleanupPlaceholders})
+         AND id NOT IN (${selectedPlaceholders})
+    `).run(...cleanupDates, ...selectedIds);
+    staleChanges = Number(staleResult?.changes || 0);
+  }
+  console.log(`[API_FOOTBALL] Limpeza seletiva: ${staleChanges} registro(s) obsoleto(s) removido(s); históricos preservados.`);
 
   // Limpa destaques de dados API; serão recalculados com base em hoje.
   db.prepare(`UPDATE matches SET is_featured = 0 WHERE source_provider = 'api_football'`).run();
@@ -311,6 +346,7 @@ async function main() {
   let insertedOrUpdated = 0;
   let verifiedVideos = 0;
   let lookups = 0;
+  let skippedVideoRetries = 0;
 
   for (const f of selected) {
     const comp = compFor(f.league);
@@ -335,17 +371,24 @@ async function main() {
     let videoPublishedAt = existing?.video_published_at || null;
     let videoVerifiedAt = existing?.video_verified_at || null;
     let videoConfidence = Number(existing?.video_confidence || 0);
+    let videoLookupAttemptedAt = existing?.video_lookup_attempted_at || null;
 
     // Partida ainda não terminou: qualquer URL sem análise é inválida para esta partida atual.
     if (!FINISHED.has(short) && !existing?.analysis_id) {
       videoUrl = null; videoTitle = null; videoPublishedAt = null; videoVerifiedAt = null; videoConfidence = 0;
     }
 
-    // Para partidas terminadas, só aceitamos vídeo com verificação V6.
-    if (FINISHED.has(short) && !existing?.analysis_id && !videoVerifiedAt && lookups < 5) {
-      const lastAttempt = parseTs(existing?.video_lookup_attempted_at);
-      if (!lastAttempt || Date.now() - lastAttempt > 6 * 60 * 60 * 1000) {
+    // Pós-jogo automático: enquanto não houver vídeo validado, tentamos de novo
+    // com frequência progressiva. A busca no YouTube não consome quota da
+    // API-Football. Limitamos a 8 partidas por ciclo para evitar rajadas.
+    if (FINISHED.has(short) && !existing?.analysis_id && !videoVerifiedAt) {
+      const lastAttempt = parseTs(videoLookupAttemptedAt);
+      const retryAfter = videoRetryIntervalMs(f);
+
+      if (lookups < 8 && (!lastAttempt || Date.now() - lastAttempt >= retryAfter)) {
         lookups++;
+        videoLookupAttemptedAt = nowIso();
+        console.log(`[VIDEO_VERIFY] Tentativa ${f.teams?.home?.name} x ${f.teams?.away?.name}; nova janela=${Math.round(retryAfter / 60000)}min.`);
         const verified = await findVerifiedVideo(f);
         if (verified) {
           videoUrl = verified.url;
@@ -356,6 +399,8 @@ async function main() {
           verifiedVideos++;
           console.log(`[VIDEO_VERIFY] OK ${f.teams?.home?.name} x ${f.teams?.away?.name} | ${verified.publishedAt} | confiança=${verified.confidence}`);
         }
+      } else if (lastAttempt && Date.now() - lastAttempt < retryAfter) {
+        skippedVideoRetries++;
       }
     }
 
@@ -416,7 +461,7 @@ async function main() {
       videoUrl, matchDate, round, stadium, status, isFeature,
       scoreHome, scoreAway, fixtureId, nowIso(), String(f.fixture?.date || ''), short,
       String(f.fixture?.timezone || TZ), city, videoTitle, videoPublishedAt, videoVerifiedAt,
-      videoConfidence, FINISHED.has(short) ? nowIso() : existing?.video_lookup_attempted_at || null
+      videoConfidence, videoLookupAttemptedAt
     );
     insertedOrUpdated++;
   }
@@ -428,9 +473,12 @@ async function main() {
 
   settingSet('api_football_last_sync_at', nowIso());
   if (!fullSyncToday) settingSet('api_football_last_full_sync_date', localToday);
-  if (remaining != null) settingSet('api_football_last_remaining_quota', remaining);
+  if (remaining != null) {
+    settingSet('api_football_last_remaining_quota', remaining);
+    settingSet('api_football_last_quota_date', localToday);
+  }
   settingSet('api_football_sync_schema_version', SYNC_VERSION);
-  console.log(`[API_FOOTBALL] OK: partidas atualizadas=${insertedOrUpdated}; vídeos validados=${verifiedVideos}; buscas de vídeo=${lookups}; versão=${SYNC_VERSION}.`);
+  console.log(`[API_FOOTBALL] OK: partidas atualizadas=${insertedOrUpdated}; vídeos validados=${verifiedVideos}; buscas de vídeo=${lookups}; retries aguardando janela=${skippedVideoRetries}; versão=${SYNC_VERSION}.`);
 }
 
 main()
