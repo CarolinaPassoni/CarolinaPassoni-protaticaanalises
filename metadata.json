@@ -1,0 +1,8 @@
+{
+  "name": "ProTática - Análise Tática e Scouting Profissional",
+  "description": "Plataforma de análise tática esportiva com IA, período de demonstração gratuito de 7 dias e assinaturas pagas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
