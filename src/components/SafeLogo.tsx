@@ -15,13 +15,34 @@ export const SafeLogo: React.FC<SafeLogoProps> = ({
   fallback,
   fallbackClassName = '',
 }) => {
-  const [failed, setFailed] = useState(!src);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
 
   useEffect(() => {
-    setFailed(!src);
+    let cancelled = false;
+    setLoadedSrc(null);
+
+    if (!src || typeof window === 'undefined') return;
+
+    // Só coloca a imagem no DOM depois de confirmar que ela realmente carregou.
+    // Assim URLs externas inválidas/bloqueadas nunca exibem o ícone quebrado.
+    const probe = new Image();
+    probe.referrerPolicy = 'no-referrer';
+    probe.onload = () => {
+      if (!cancelled) setLoadedSrc(src);
+    };
+    probe.onerror = () => {
+      if (!cancelled) setLoadedSrc(null);
+    };
+    probe.src = src;
+
+    return () => {
+      cancelled = true;
+      probe.onload = null;
+      probe.onerror = null;
+    };
   }, [src]);
 
-  if (failed || !src) {
+  if (!src || loadedSrc !== src) {
     return (
       <div
         className={fallbackClassName}
@@ -36,12 +57,12 @@ export const SafeLogo: React.FC<SafeLogoProps> = ({
 
   return (
     <img
-      src={src}
+      src={loadedSrc}
       alt={alt}
       className={className}
       loading="lazy"
       referrerPolicy="no-referrer"
-      onError={() => setFailed(true)}
+      onError={() => setLoadedSrc(null)}
     />
   );
 };

@@ -1,0 +1,13 @@
+PROTÁTICA — PATCH V3 DE IMAGENS
+
+Este patch substitui somente:
+- src/components/SafeLogo.tsx
+- src/main.tsx
+
+Objetivo:
+1. Nunca exibir o ícone de imagem quebrada.
+2. Exibir fallback (troféu/iniciais) enquanto o logo externo não carregar.
+3. Manter fotos e logos válidos quando carregarem normalmente.
+
+No GitHub, extraia este ZIP e envie a pasta src preservando a estrutura.
+Não apague os demais arquivos do repositório.
