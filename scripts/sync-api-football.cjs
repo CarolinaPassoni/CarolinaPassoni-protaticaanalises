@@ -1,4 +1,4 @@
-/* ProTática V6.4 — API-Football + validação rígida de vídeo
+/* ProTática V6.5 — API-Football + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -17,7 +17,7 @@ const TURSO_URL = String(process.env.TURSO_DATABASE_URL || '').trim();
 const TURSO_TOKEN = String(process.env.TURSO_AUTH_TOKEN || '').trim();
 const TZ = 'America/Sao_Paulo';
 const production = process.env.NODE_ENV === 'production';
-const SYNC_VERSION = '6.4';
+const SYNC_VERSION = '6.5';
 
 if (!production) {
   console.log('[API_FOOTBALL] Ambiente local: sincronização automática ignorada.');
@@ -243,28 +243,30 @@ async function main() {
   const lastSync = settingGet('api_football_last_sync_at');
   const previousSyncVersion = settingGet('api_football_sync_schema_version');
   const cacheFresh = lastSync && Date.now() - parseTs(lastSync) < 50 * 60 * 1000;
+  const isSyncMigration = previousSyncVersion !== SYNC_VERSION;
 
   // Mudanças nas regras de seleção/limpeza precisam de uma sincronização real
   // mesmo que o cache horário ainda esteja válido.
-  if (cacheFresh && previousSyncVersion === SYNC_VERSION) {
+  if (cacheFresh && !isSyncMigration) {
     console.log('[API_FOOTBALL] Cache válido; nova chamada não é necessária.');
     return;
   }
-  if (cacheFresh && previousSyncVersion !== SYNC_VERSION) {
+  if (cacheFresh && isSyncMigration) {
     console.log(`[API_FOOTBALL] Cache ignorado para migração de sincronização ${previousSyncVersion || 'legado'} -> ${SYNC_VERSION}.`);
   }
 
   const localToday = today();
   const fullSyncToday = settingGet('api_football_last_full_sync_date') === localToday;
 
-  console.log(`[API_FOOTBALL] Sincronizando ${fullSyncToday ? 'jogos de hoje' : 'janela Free de 3 dias'}...`);
+  // Em uma migração de regra, revalidamos obrigatoriamente ontem/hoje/amanhã,
+  // mesmo se a carga completa do dia já tiver sido marcada anteriormente.
+  const mustRefreshFreeWindow = isSyncMigration || !fullSyncToday;
 
-  // No plano Free, a API-Football libera apenas ontem, hoje e amanhã.
-  // Por isso fazemos 3 consultas na primeira sincronização do dia e, nas
-  // demais horas, apenas 1 consulta para a data atual.
-  const datesToFetch = fullSyncToday
-    ? [localToday]
-    : [-1, 0, 1].map((offset) => shiftDate(offset));
+  console.log(`[API_FOOTBALL] Sincronizando ${mustRefreshFreeWindow ? 'janela Free de 3 dias' : 'jogos de hoje'}...`);
+
+  const datesToFetch = mustRefreshFreeWindow
+    ? [-1, 0, 1].map((offset) => shiftDate(offset))
+    : [localToday];
 
   const rowsByFixture = new Map();
   let remaining = null;
