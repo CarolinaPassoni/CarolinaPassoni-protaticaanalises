@@ -1,4 +1,4 @@
-/* ProTática V6.2 — API-Football + validação rígida de vídeo
+/* ProTática V6.3 — API-Football + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -76,7 +76,13 @@ const COMPETITIONS = [
 const compFor = (league) => {
   const name = norm(league?.name);
   const country = norm(league?.country);
-  return COMPETITIONS.find(c => (!c.country || country === c.country) && c.names.some(n => name === n || name.includes(n)));
+
+  // Correspondência exata por nome normalizado.
+  // Evita falsos positivos como "AFC Champions League" sendo tratada
+  // como "UEFA Champions League", ou torneios de base/femininos como World Cup.
+  return COMPETITIONS.find(
+    c => (!c.country || country === c.country) && c.names.some(n => name === n)
+  );
 };
 
 const FINISHED = new Set(['FT','AET','PEN']);
@@ -242,7 +248,7 @@ async function main() {
   const localToday = today();
   const fullSyncToday = settingGet('api_football_last_full_sync_date') === localToday;
 
-  console.log(`[API_FOOTBALL] Sincronizando ${fullSyncToday ? 'jogos de hoje' : 'janela de 5 dias'}...`);
+  console.log(`[API_FOOTBALL] Sincronizando ${fullSyncToday ? 'jogos de hoje' : 'janela Free de 3 dias'}...`);
 
   // No plano Free, a API-Football libera apenas ontem, hoje e amanhã.
   // Por isso fazemos 3 consultas na primeira sincronização do dia e, nas
@@ -398,8 +404,15 @@ async function main() {
   console.log(`[API_FOOTBALL] OK: partidas atualizadas=${insertedOrUpdated}; vídeos validados=${verifiedVideos}; buscas de vídeo=${lookups}.`);
 }
 
-main().catch(err => {
-  console.error('[API_FOOTBALL] Falha na sincronização:', err?.stack || err?.message || err);
-  // Não derruba o ProTática por indisponibilidade temporária do provedor.
-  process.exit(0);
-});
+main()
+  .then(() => {
+    // Este script roda via spawnSync antes do servidor principal.
+    // O cliente libSQL pode manter handles de rede abertos; encerramos
+    // explicitamente para não bloquear a subida da porta HTTP no Render.
+    process.exit(0);
+  })
+  .catch(err => {
+    console.error('[API_FOOTBALL] Falha na sincronização:', err?.stack || err?.message || err);
+    // Não derruba o ProTática por indisponibilidade temporária do provedor.
+    process.exit(0);
+  });
