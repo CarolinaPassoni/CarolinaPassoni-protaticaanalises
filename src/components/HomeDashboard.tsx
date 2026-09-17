@@ -20,6 +20,8 @@ import {
 } from 'lucide-react';
 import { AnalysisHistoryItem, Match, Competition } from '../types';
 import PlayerPhoto from './PlayerPhoto';
+import SafeLogo from './SafeLogo';
+import { resolveMatchVideoSource } from '../services/matchSourceService';
 
 interface HomeDashboardProps {
   onNavigate: (view: string, params?: any) => void;
@@ -37,6 +39,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const [featuredMatches, setFeaturedMatches] = useState<Match[]>([]);
   const [featuredCompetitions, setFeaturedCompetitions] = useState<Competition[]>([]);
   const [loadingFeatured, setLoadingFeatured] = useState<boolean>(true);
+  const [resolvingMatchId, setResolvingMatchId] = useState<string | null>(null);
 
   useEffect(() => {
     const loadHomeData = async () => {
@@ -64,6 +67,24 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
 
     loadHomeData();
   }, []);
+
+
+  const handleAnalyzeFeaturedMatch = async (match: Match) => {
+    try {
+      setResolvingMatchId(match.id);
+      const resolved = await resolveMatchVideoSource(match);
+      setFeaturedMatches((prev) => prev.map((m) => (m.id === match.id ? resolved.match : m)));
+      if (onSelectMatchToAnalyze) {
+        onSelectMatchToAnalyze(resolved.match);
+      } else {
+        onNavigate('new-analysis', { videoUrl: resolved.match.videoUrl });
+      }
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Não foi possível localizar automaticamente o vídeo desta partida.');
+    } finally {
+      setResolvingMatchId(null);
+    }
+  };
 
   return (
     <div className="space-y-8 animate-fadeIn pb-12">
@@ -224,16 +245,12 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                     </button>
                   ) : (
                     <button
-                      onClick={() => {
-                        if (onSelectMatchToAnalyze) {
-                          onSelectMatchToAnalyze(match);
-                        } else {
-                          onNavigate('new-analysis');
-                        }
-                      }}
-                      className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs rounded-xl shadow transition-all cursor-pointer"
+                      onClick={() => handleAnalyzeFeaturedMatch(match)}
+                      disabled={resolvingMatchId === match.id}
+                      className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-wait text-black font-bold text-xs rounded-xl shadow transition-all cursor-pointer"
                     >
-                      <PlayCircle className="w-3.5 h-3.5" /> ANALISAR ESTA PARTIDA
+                      <PlayCircle className="w-3.5 h-3.5" />
+                      {resolvingMatchId === match.id ? 'LOCALIZANDO VÍDEO...' : 'ANALISAR ESTA PARTIDA'}
                     </button>
                   )}
                 </div>
@@ -275,19 +292,13 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
               onClick={() => onNavigate('competitions')}
               className="bg-[#170306] border border-amber-950/40 hover:border-amber-500/40 rounded-2xl p-4 text-center cursor-pointer transition-all duration-200 group hover:-translate-y-0.5 hover:shadow-lg"
             >
-              {comp.logoUrl ? (
-                <div className="w-12 h-12 rounded-xl bg-white/5 p-1.5 border border-white/10 mx-auto flex items-center justify-center mb-2 group-hover:scale-105 transition-transform">
-                  <img
-                    src={comp.logoUrl}
-                    alt={comp.name}
-                    className="max-h-full max-w-full object-contain"
-                  />
-                </div>
-              ) : (
-                <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 mx-auto flex items-center justify-center text-amber-400 mb-2">
-                  <Trophy className="w-6 h-6" />
-                </div>
-              )}
+              <SafeLogo
+                src={comp.logoUrl}
+                alt={comp.name}
+                className="w-12 h-12 rounded-xl bg-white/5 p-1.5 border border-white/10 mx-auto object-contain mb-2 group-hover:scale-105 transition-transform"
+                fallback={<Trophy className="w-6 h-6" />}
+                fallbackClassName="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 mx-auto flex items-center justify-center text-amber-400 mb-2"
+              />
               <h4 className="text-xs font-bold text-white group-hover:text-amber-300 transition-colors truncate">
                 {comp.name}
               </h4>

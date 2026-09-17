@@ -21,6 +21,8 @@ import {
 } from 'lucide-react';
 import { Competition, Match } from '../types';
 import PlayerPhoto from './PlayerPhoto';
+import SafeLogo from './SafeLogo';
+import { resolveMatchVideoSource } from '../services/matchSourceService';
 import { getAuthHeaders } from '../services/geminiService';
 
 interface CompetitionsModuleProps {
@@ -42,6 +44,7 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [regionFilter, setRegionFilter] = useState<string>('all');
   const [activeTab, setActiveTab] = useState<'matches' | 'analyses' | 'standings' | 'teams' | 'highlights'>('matches');
+  const [resolvingMatchId, setResolvingMatchId] = useState<string | null>(null);
 
   // Admin new match modal state
   const [showAddMatchModal, setShowAddMatchModal] = useState<boolean>(false);
@@ -57,6 +60,20 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
     featuredPlayerPosition: '',
     featuredPlayerTeam: '',
   });
+
+
+  const handleAnalyzeMatch = async (match: Match) => {
+    try {
+      setResolvingMatchId(match.id);
+      const resolved = await resolveMatchVideoSource(match);
+      setMatches((prev) => prev.map((m) => (m.id === match.id ? resolved.match : m)));
+      onSelectMatchToAnalyze(resolved.match);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Não foi possível localizar automaticamente um vídeo confiável desta partida.');
+    } finally {
+      setResolvingMatchId(null);
+    }
+  };
 
   const fetchCompetitions = async () => {
     try {
@@ -209,19 +226,13 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
 
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div className="flex items-center gap-4">
-              {selectedComp.logoUrl ? (
-                <div className="w-16 h-16 rounded-xl bg-white/10 p-2 border border-white/10 flex items-center justify-center shrink-0">
-                  <img
-                    src={selectedComp.logoUrl}
-                    alt={selectedComp.name}
-                    className="max-h-full max-w-full object-contain"
-                  />
-                </div>
-              ) : (
-                <div className="w-16 h-16 rounded-xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 font-bold text-xl shrink-0">
-                  <Trophy className="w-8 h-8" />
-                </div>
-              )}
+              <SafeLogo
+                src={selectedComp.logoUrl}
+                alt={selectedComp.name}
+                className="w-16 h-16 rounded-xl bg-white/10 p-2 border border-white/10 object-contain shrink-0"
+                fallback={<Trophy className="w-8 h-8" />}
+                fallbackClassName="w-16 h-16 rounded-xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 font-bold text-xl shrink-0"
+              />
               <div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-amber-400 font-medium">{selectedComp.country}</span>
@@ -286,19 +297,13 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
             >
               <div>
                 <div className="flex items-start justify-between gap-3 mb-4">
-                  {comp.logoUrl ? (
-                    <div className="w-12 h-12 rounded-xl bg-white/5 p-1.5 border border-white/10 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
-                      <img
-                        src={comp.logoUrl}
-                        alt={comp.name}
-                        className="max-h-full max-w-full object-contain"
-                      />
-                    </div>
-                  ) : (
-                    <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 shrink-0">
-                      <Trophy className="w-6 h-6" />
-                    </div>
-                  )}
+                  <SafeLogo
+                    src={comp.logoUrl}
+                    alt={comp.name}
+                    className="w-12 h-12 rounded-xl bg-white/5 p-1.5 border border-white/10 object-contain shrink-0 group-hover:scale-105 transition-transform"
+                    fallback={<Trophy className="w-6 h-6" />}
+                    fallbackClassName="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 shrink-0"
+                  />
                   <span className="text-[11px] font-medium text-zinc-400 bg-zinc-900/60 px-2 py-0.5 rounded-md border border-zinc-800">
                     {comp.season}
                   </span>
@@ -352,13 +357,13 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
                           {/* Teams vs */}
                           <div className="flex items-center gap-3">
                             <div className="flex items-center gap-2">
-                              {match.homeTeamLogo && (
-                                <img
-                                  src={match.homeTeamLogo}
-                                  alt={match.homeTeam}
-                                  className="w-6 h-6 object-contain"
-                                />
-                              )}
+                              <SafeLogo
+                                src={match.homeTeamLogo}
+                                alt={match.homeTeam}
+                                className="w-6 h-6 object-contain"
+                                fallback={match.homeTeam.slice(0, 2).toUpperCase()}
+                                fallbackClassName="w-6 h-6 rounded bg-amber-500/10 border border-amber-500/20 text-[9px] font-bold text-amber-300 flex items-center justify-center"
+                              />
                               <span className="font-bold text-sm md:text-base text-white">{match.homeTeam}</span>
                             </div>
 
@@ -367,13 +372,13 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
                             </span>
 
                             <div className="flex items-center gap-2">
-                              {match.awayTeamLogo && (
-                                <img
-                                  src={match.awayTeamLogo}
-                                  alt={match.awayTeam}
-                                  className="w-6 h-6 object-contain"
-                                />
-                              )}
+                              <SafeLogo
+                                src={match.awayTeamLogo}
+                                alt={match.awayTeam}
+                                className="w-6 h-6 object-contain"
+                                fallback={match.awayTeam.slice(0, 2).toUpperCase()}
+                                fallbackClassName="w-6 h-6 rounded bg-amber-500/10 border border-amber-500/20 text-[9px] font-bold text-amber-300 flex items-center justify-center"
+                              />
                               <span className="font-bold text-sm md:text-base text-white">{match.awayTeam}</span>
                             </div>
                           </div>
@@ -415,10 +420,12 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
                             </button>
                           ) : (
                             <button
-                              onClick={() => onSelectMatchToAnalyze(match)}
-                              className="flex-1 md:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all"
+                              onClick={() => handleAnalyzeMatch(match)}
+                              disabled={resolvingMatchId === match.id}
+                              className="flex-1 md:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-60 disabled:cursor-wait text-black font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all"
                             >
-                              <PlayCircle className="w-4 h-4" /> ANALISAR ESTA PARTIDA
+                              <PlayCircle className="w-4 h-4" />
+                              {resolvingMatchId === match.id ? 'LOCALIZANDO VÍDEO...' : 'ANALISAR ESTA PARTIDA'}
                             </button>
                           )}
                         </div>

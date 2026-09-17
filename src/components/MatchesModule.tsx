@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import { Match, Competition } from '../types';
 import PlayerPhoto from './PlayerPhoto';
+import SafeLogo from './SafeLogo';
+import { resolveMatchVideoSource } from '../services/matchSourceService';
 import { getAuthHeaders } from '../services/geminiService';
 
 interface MatchesModuleProps {
@@ -36,6 +38,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [selectedCompId, setSelectedCompId] = useState<string>('all');
   const [filterFeatured, setFilterFeatured] = useState<boolean>(false);
+  const [resolvingMatchId, setResolvingMatchId] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
@@ -100,6 +103,20 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
     } catch (err) {
       console.error('Error updating match video URL:', err);
       window.alert('Falha de conexão ao atualizar a URL do vídeo.');
+    }
+  };
+
+
+  const handleAnalyzeMatch = async (match: Match) => {
+    try {
+      setResolvingMatchId(match.id);
+      const resolved = await resolveMatchVideoSource(match);
+      setMatches((prev) => prev.map((m) => (m.id === match.id ? resolved.match : m)));
+      onSelectMatchToAnalyze(resolved.match);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : 'Não foi possível localizar automaticamente um vídeo confiável desta partida.');
+    } finally {
+      setResolvingMatchId(null);
     }
   };
 
@@ -195,15 +212,13 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                   {/* Top Bar: Comp Name & Round */}
                   <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-amber-950/30 text-xs">
                     <div className="flex items-center gap-2">
-                      {match.competitionLogo ? (
-                        <img
-                          src={match.competitionLogo}
-                          alt={match.competitionName}
-                          className="w-4 h-4 object-contain"
-                        />
-                      ) : (
-                        <Trophy className="w-4 h-4 text-amber-400" />
-                      )}
+                      <SafeLogo
+                        src={match.competitionLogo}
+                        alt={match.competitionName || 'Competição'}
+                        className="w-4 h-4 object-contain"
+                        fallback={<Trophy className="w-4 h-4 text-amber-400" />}
+                        fallbackClassName="w-4 h-4 flex items-center justify-center"
+                      />
                       <span className="font-semibold text-amber-400 truncate max-w-[160px]">
                         {match.competitionName || 'Competição'}
                       </span>
@@ -298,7 +313,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                     <div className="min-w-0">
                       <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Vídeo-fonte</p>
                       <p className={`text-[11px] truncate ${match.videoUrl ? 'text-emerald-400' : 'text-amber-400'}`}>
-                        {match.videoUrl ? 'Vinculado ao YouTube' : 'Ainda não vinculado'}
+                        {match.videoUrl ? 'Fonte localizada' : 'Fonte automática ao analisar'}
                       </p>
                     </div>
                     <button
@@ -307,7 +322,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                       className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] font-bold text-amber-300 hover:bg-amber-500/20"
                     >
                       <ExternalLink className="w-3 h-3" />
-                      {match.videoUrl ? 'Editar URL' : 'Vincular URL'}
+                      {match.videoUrl ? 'Ajustar fonte' : 'Definir manualmente'}
                     </button>
                   </div>
                 )}
@@ -323,10 +338,12 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                     </button>
                   ) : (
                     <button
-                      onClick={() => onSelectMatchToAnalyze(match)}
-                      className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs rounded-xl shadow-md shadow-amber-500/20 transition-all"
+                      onClick={() => handleAnalyzeMatch(match)}
+                      disabled={resolvingMatchId === match.id}
+                      className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-60 disabled:cursor-wait text-black font-bold text-xs rounded-xl shadow-md shadow-amber-500/20 transition-all"
                     >
-                      <PlayCircle className="w-4 h-4" /> ANALISAR ESTA PARTIDA
+                      <PlayCircle className="w-4 h-4" />
+                      {resolvingMatchId === match.id ? 'LOCALIZANDO VÍDEO...' : 'ANALISAR ESTA PARTIDA'}
                     </button>
                   )}
                 </div>

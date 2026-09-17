@@ -297,7 +297,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <>
       {/* Desktop Fixed Sidebar */}
       <aside
-        className={`hidden md:block fixed top-0 left-0 bottom-0 z-30 transition-all duration-300 shadow-2xl ${
+        className={`hidden md:block fixed top-0 left-0 bottom-0 z-[1100] transition-all duration-300 shadow-2xl ${
           isCollapsed ? 'w-16' : 'w-64'
         }`}
       >

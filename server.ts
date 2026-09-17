@@ -3357,6 +3357,98 @@ app.delete('/api/competitions/:id', requireAdmin, (req, res) => {
 });
 
 // ========================================================
+// --- RESOLUÇÃO AUTOMÁTICA DE VÍDEO-FONTE ---
+// ========================================================
+const normalizeSearchText = (value: unknown): string =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+const meaningfulTeamTokens = (teamName: string): string[] => {
+  const ignored = new Set(['fc', 'cf', 'sc', 'ac', 'ec', 'club', 'clube', 'futebol', 'football', 'de', 'do', 'da']);
+  return normalizeSearchText(teamName)
+    .split(' ')
+    .filter((token) => token.length >= 3 && !ignored.has(token));
+};
+
+const tokenCoverage = (title: string, tokens: string[]): number => {
+  if (!tokens.length) return 0;
+  const normalized = ` ${normalizeSearchText(title)} `;
+  const hits = tokens.filter((token) => normalized.includes(` ${token} `)).length;
+  return hits / tokens.length;
+};
+
+const findAutomaticMatchVideo = async (match: any) => {
+  const competition = match?.competitionId ? getCompetitionById(match.competitionId) : null;
+  const season = String(competition?.season || '');
+  const query = [
+    match.homeTeam,
+    match.awayTeam,
+    match.competitionName || competition?.name || '',
+    season,
+    'highlights melhores momentos football soccer',
+  ].filter(Boolean).join(' ');
+
+  // play-dl performs YouTube search without requiring a YouTube Data API key.
+  const playModule: any = await import('play-dl');
+  const searchFn = playModule.search || playModule.default?.search;
+  if (typeof searchFn !== 'function') {
+    throw new Error('Mecanismo de busca de vídeo indisponível no servidor.');
+  }
+
+  const results: any[] = await searchFn(query, {
+    limit: 12,
+    source: { youtube: 'video' },
+  });
+
+  const homeTokens = meaningfulTeamTokens(match.homeTeam || '');
+  const awayTokens = meaningfulTeamTokens(match.awayTeam || '');
+  const competitionTokens = meaningfulTeamTokens(match.competitionName || competition?.name || '');
+  const seasonYear = (season.match(/20\d{2}/) || [])[0] || '';
+
+  const candidates = (results || [])
+    .map((video: any) => {
+      const title = String(video?.title || '');
+      const homeCoverage = tokenCoverage(title, homeTokens);
+      const awayCoverage = tokenCoverage(title, awayTokens);
+      const competitionCoverage = competitionTokens.length ? tokenCoverage(title, competitionTokens) : 0;
+      const normalizedTitle = normalizeSearchText(title);
+      const url = String(video?.url || (video?.id ? `https://www.youtube.com/watch?v=${video.id}` : '')).trim();
+      const duration = Number(video?.durationInSec || 0);
+
+      let score = (homeCoverage * 5) + (awayCoverage * 5) + (competitionCoverage * 2);
+      if (/highlights|melhores momentos|best moments|resumen|extended highlights/.test(normalizedTitle)) score += 1.5;
+      if (/full match|jogo completo|partida completa/.test(normalizedTitle)) score += 1;
+      if (seasonYear && normalizedTitle.includes(seasonYear)) score += 1.5;
+      if (duration >= 120) score += 0.5;
+      if (duration > 0 && duration < 45) score -= 2;
+      if (/shorts|short /.test(normalizedTitle)) score -= 1.5;
+
+      return {
+        title,
+        url,
+        score,
+        homeCoverage,
+        awayCoverage,
+        duration,
+      };
+    })
+    .filter((candidate: any) =>
+      candidate.url &&
+      candidate.homeCoverage >= 0.6 &&
+      candidate.awayCoverage >= 0.6
+    )
+    .sort((a: any, b: any) => b.score - a.score);
+
+  const best = candidates[0];
+  if (!best || best.score < 7.5) return null;
+  return best;
+};
+
+// ========================================================
 // --- PARTIDAS (MATCHES API) ---
 // ========================================================
 app.get('/api/matches', (req, res) => {
@@ -3371,6 +3463,41 @@ app.get('/api/matches', (req, res) => {
     res.json({ matches });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Erro ao listar partidas.' });
+  }
+});
+
+app.post('/api/matches/:id/resolve-video', requireAuth, async (req, res) => {
+  try {
+    const match = getMatchById(req.params.id);
+    if (!match) {
+      return res.status(404).json({ error: 'Partida não encontrada.' });
+    }
+
+    if (String(match.videoUrl || '').trim()) {
+      return res.json({ match, cached: true, confidence: 100 });
+    }
+
+    const source = await findAutomaticMatchVideo(match);
+    if (!source) {
+      return res.status(404).json({
+        error: 'Não encontrei automaticamente um vídeo suficientemente confiável para esta partida. O sistema não usará um vídeo possivelmente errado.',
+      });
+    }
+
+    const saved = saveMatch({
+      ...match,
+      videoUrl: source.url,
+    });
+
+    return res.json({
+      match: saved,
+      sourceTitle: source.title,
+      confidence: Math.min(99, Math.round(source.score * 8)),
+      cached: false,
+    });
+  } catch (err: any) {
+    console.error('[MATCH_SOURCE] Erro ao localizar vídeo automaticamente:', err);
+    return res.status(500).json({ error: err.message || 'Erro ao localizar vídeo automaticamente.' });
   }
 });
 
