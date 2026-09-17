@@ -649,7 +649,7 @@ const syncDatabaseSchema = () => {
   // Seed initial featured matches if matches table is empty
   try {
     const matchCount: any = db.prepare('SELECT COUNT(*) as count FROM matches').get();
-    if (matchCount?.count === 0) {
+    if (!production && matchCount?.count === 0) {
       const initialMatches = [
         {
           id: 'match_fla_pal',
@@ -757,6 +757,33 @@ const syncDatabaseSchema = () => {
     }
   } catch (e: any) {
     console.warn('[DB Migration] Erro ao semear partidas:', e.message);
+  }
+
+  // Production must never present the original showcase fixtures as real matches.
+  // Remove only untouched seeded rows; if an admin already linked a source or analysis,
+  // preserve that row to avoid deleting real work.
+  if (production) {
+    try {
+      const demoMatchIds = [
+        'match_fla_pal',
+        'match_rma_mci',
+        'match_ars_liv',
+        'match_bar_bay',
+        'match_bot_riv',
+      ];
+      const placeholders = demoMatchIds.map(() => '?').join(',');
+      const result: any = db.prepare(`
+        DELETE FROM matches
+        WHERE id IN (${placeholders})
+          AND COALESCE(video_url, '') = ''
+          AND analysis_id IS NULL
+      `).run(...demoMatchIds);
+      if (Number(result?.changes || 0) > 0) {
+        console.log(`[DB Migration] ${result.changes} partida(s) demonstrativa(s) removida(s) do ambiente de produção.`);
+      }
+    } catch (e: any) {
+      console.warn('[DB Migration] Falha ao limpar partidas demonstrativas em produção:', e.message);
+    }
   }
 
   // Seed player catalog initial entries with verified identity

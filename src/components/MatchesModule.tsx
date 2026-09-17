@@ -203,6 +203,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {filteredMatches.map((match) => {
             const hasAnalysis = Boolean(match.analysisId);
+            const canAnalyze = Boolean(match.videoUrl) || match.status === 'finished';
             return (
               <div
                 key={match.id}
@@ -336,7 +337,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                     >
                       <CheckCircle2 className="w-4 h-4" /> VER ANÁLISE DISPONÍVEL
                     </button>
-                  ) : (
+                  ) : canAnalyze ? (
                     <button
                       onClick={() => handleAnalyzeMatch(match)}
                       disabled={resolvingMatchId === match.id}
@@ -345,6 +346,11 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                       <PlayCircle className="w-4 h-4" />
                       {resolvingMatchId === match.id ? 'LOCALIZANDO VÍDEO...' : 'ANALISAR ESTA PARTIDA'}
                     </button>
+                  ) : (
+                    <div className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-zinc-900/70 border border-zinc-800 text-zinc-400 font-bold text-xs rounded-xl">
+                      <Clock className="w-4 h-4" />
+                      {match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO DA PARTIDA'}
+                    </div>
                   )}
                 </div>
               </div>

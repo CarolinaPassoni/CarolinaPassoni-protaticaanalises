@@ -154,6 +154,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {featuredMatches.slice(0, 3).map((match) => {
             const hasAnalysis = Boolean(match.analysisId);
+            const canAnalyze = Boolean(match.videoUrl) || match.status === 'finished';
             return (
               <div
                 key={match.id}
@@ -243,7 +244,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                     >
                       <CheckCircle2 className="w-3.5 h-3.5" /> VER ANÁLISE
                     </button>
-                  ) : (
+                  ) : canAnalyze ? (
                     <button
                       onClick={() => handleAnalyzeFeaturedMatch(match)}
                       disabled={resolvingMatchId === match.id}
@@ -252,6 +253,11 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                       <PlayCircle className="w-3.5 h-3.5" />
                       {resolvingMatchId === match.id ? 'LOCALIZANDO VÍDEO...' : 'ANALISAR ESTA PARTIDA'}
                     </button>
+                  ) : (
+                    <div className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-zinc-900/70 border border-zinc-800 text-zinc-400 font-bold text-xs rounded-xl">
+                      <Calendar className="w-3.5 h-3.5" />
+                      {match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO'}
+                    </div>
                   )}
                 </div>
               </div>

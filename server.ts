@@ -3374,6 +3374,35 @@ const meaningfulTeamTokens = (teamName: string): string[] => {
     .filter((token) => token.length >= 3 && !ignored.has(token));
 };
 
+const TEAM_VIDEO_ALIASES: Record<string, string[]> = {
+  'manchester city': ['manchester city', 'man city', 'mancity'],
+  'manchester united': ['manchester united', 'man united', 'man utd'],
+  'real madrid': ['real madrid', 'real madrid cf'],
+  'barcelona': ['barcelona', 'fc barcelona', 'barca'],
+  'bayern munchen': ['bayern munchen', 'bayern munich', 'bayern'],
+  'bayern munchen fc': ['bayern munchen', 'bayern munich', 'bayern'],
+  'paris saint germain': ['paris saint germain', 'psg'],
+  'internazionale': ['internazionale', 'inter milan', 'inter'],
+};
+
+const getTeamVideoAliases = (teamName: string): string[] => {
+  const normalized = normalizeSearchText(teamName);
+  const aliases = TEAM_VIDEO_ALIASES[normalized] || [];
+  return Array.from(new Set([normalized, ...aliases].filter(Boolean)));
+};
+
+const titleContainsTeam = (title: string, teamName: string): boolean => {
+  const normalizedTitle = ` ${normalizeSearchText(title)} `;
+  const aliases = getTeamVideoAliases(teamName);
+  if (aliases.some((alias) => normalizedTitle.includes(` ${alias} `))) return true;
+
+  // Generic fallback for clubs not present in the alias table.
+  const tokens = meaningfulTeamTokens(teamName);
+  if (!tokens.length) return false;
+  const hits = tokens.filter((token) => normalizedTitle.includes(` ${token} `)).length;
+  return hits / tokens.length >= 0.6;
+};
+
 const tokenCoverage = (title: string, tokens: string[]): number => {
   if (!tokens.length) return 0;
   const normalized = ` ${normalizeSearchText(title)} `;
@@ -3384,67 +3413,66 @@ const tokenCoverage = (title: string, tokens: string[]): number => {
 const findAutomaticMatchVideo = async (match: any) => {
   const competition = match?.competitionId ? getCompetitionById(match.competitionId) : null;
   const season = String(competition?.season || '');
-  const query = [
-    match.homeTeam,
-    match.awayTeam,
-    match.competitionName || competition?.name || '',
-    season,
-    'highlights melhores momentos football soccer',
-  ].filter(Boolean).join(' ');
+  const competitionName = match.competitionName || competition?.name || '';
 
-  // play-dl performs YouTube search without requiring a YouTube Data API key.
   const playModule: any = await import('play-dl');
   const searchFn = playModule.search || playModule.default?.search;
   if (typeof searchFn !== 'function') {
     throw new Error('Mecanismo de busca de vídeo indisponível no servidor.');
   }
 
-  const results: any[] = await searchFn(query, {
-    limit: 12,
-    source: { youtube: 'video' },
-  });
+  // Multiple queries are intentional: YouTube titles often abbreviate clubs
+  // (e.g. "Man City") and may omit the competition/season.
+  const homeAlias = getTeamVideoAliases(match.homeTeam || '')[1] || match.homeTeam;
+  const awayAlias = getTeamVideoAliases(match.awayTeam || '')[1] || match.awayTeam;
+  const queries = Array.from(new Set([
+    `${match.homeTeam} ${match.awayTeam} highlights`,
+    `${match.homeTeam} ${match.awayTeam} melhores momentos`,
+    `${homeAlias} ${awayAlias} highlights`,
+    competitionName ? `${match.homeTeam} ${match.awayTeam} ${competitionName} highlights` : '',
+  ].filter(Boolean)));
 
-  const homeTokens = meaningfulTeamTokens(match.homeTeam || '');
-  const awayTokens = meaningfulTeamTokens(match.awayTeam || '');
-  const competitionTokens = meaningfulTeamTokens(match.competitionName || competition?.name || '');
+  const merged = new Map<string, any>();
+  for (const query of queries) {
+    try {
+      const results: any[] = await searchFn(query, { limit: 10, source: { youtube: 'video' } });
+      for (const video of results || []) {
+        const url = String(video?.url || (video?.id ? `https://www.youtube.com/watch?v=${video.id}` : '')).trim();
+        if (url && !merged.has(url)) merged.set(url, video);
+      }
+    } catch (err) {
+      console.warn('[MATCH_SOURCE] Busca parcial falhou:', query, err);
+    }
+  }
+
+  const competitionTokens = meaningfulTeamTokens(competitionName);
   const seasonYear = (season.match(/20\d{2}/) || [])[0] || '';
 
-  const candidates = (results || [])
+  const candidates = Array.from(merged.values())
     .map((video: any) => {
       const title = String(video?.title || '');
-      const homeCoverage = tokenCoverage(title, homeTokens);
-      const awayCoverage = tokenCoverage(title, awayTokens);
-      const competitionCoverage = competitionTokens.length ? tokenCoverage(title, competitionTokens) : 0;
       const normalizedTitle = normalizeSearchText(title);
       const url = String(video?.url || (video?.id ? `https://www.youtube.com/watch?v=${video.id}` : '')).trim();
       const duration = Number(video?.durationInSec || 0);
+      const homeMatch = titleContainsTeam(title, match.homeTeam || '');
+      const awayMatch = titleContainsTeam(title, match.awayTeam || '');
+      const competitionCoverage = competitionTokens.length ? tokenCoverage(title, competitionTokens) : 0;
 
-      let score = (homeCoverage * 5) + (awayCoverage * 5) + (competitionCoverage * 2);
+      let score = (homeMatch ? 6 : 0) + (awayMatch ? 6 : 0) + (competitionCoverage * 1.5);
       if (/highlights|melhores momentos|best moments|resumen|extended highlights/.test(normalizedTitle)) score += 1.5;
       if (/full match|jogo completo|partida completa/.test(normalizedTitle)) score += 1;
-      if (seasonYear && normalizedTitle.includes(seasonYear)) score += 1.5;
-      if (duration >= 120) score += 0.5;
-      if (duration > 0 && duration < 45) score -= 2;
+      if (seasonYear && normalizedTitle.includes(seasonYear)) score += 1;
+      if (duration >= 90) score += 0.5;
+      if (duration > 0 && duration < 35) score -= 2;
       if (/shorts|short /.test(normalizedTitle)) score -= 1.5;
 
-      return {
-        title,
-        url,
-        score,
-        homeCoverage,
-        awayCoverage,
-        duration,
-      };
+      return { title, url, score, homeMatch, awayMatch, duration };
     })
-    .filter((candidate: any) =>
-      candidate.url &&
-      candidate.homeCoverage >= 0.6 &&
-      candidate.awayCoverage >= 0.6
-    )
+    .filter((candidate: any) => candidate.url && candidate.homeMatch && candidate.awayMatch)
     .sort((a: any, b: any) => b.score - a.score);
 
   const best = candidates[0];
-  if (!best || best.score < 7.5) return null;
+  if (!best || best.score < 12) return null;
   return best;
 };
 
@@ -3475,6 +3503,14 @@ app.post('/api/matches/:id/resolve-video', requireAuth, async (req, res) => {
 
     if (String(match.videoUrl || '').trim()) {
       return res.json({ match, cached: true, confidence: 100 });
+    }
+
+    if (match.status !== 'finished') {
+      return res.status(409).json({
+        error: match.status === 'live'
+          ? 'Esta partida está em andamento e ainda não possui vídeo-fonte final disponível.'
+          : 'Esta partida ainda está agendada. A análise automática será liberada quando houver um vídeo real da partida.',
+      });
     }
 
     const source = await findAutomaticMatchVideo(match);
