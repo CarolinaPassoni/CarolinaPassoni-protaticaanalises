@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "node scripts/apply-match-ui-v6-6.cjs && vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "node scripts/apply-match-ui-v6-6.cjs && node scripts/apply-match-order-v6-7.cjs && vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node scripts/start-protatica.cjs",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
