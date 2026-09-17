@@ -1,4 +1,4 @@
-/* ProTática V6 — API-Football + validação rígida de vídeo
+/* ProTática V6.1 — API-Football + validação rígida de vídeo
  *
  * - Sincroniza fixtures oficiais da API-Football no Turso.
  * - Usa apenas competições que o ProTática exibe.
@@ -241,14 +241,37 @@ async function main() {
 
   const localToday = today();
   const fullSyncToday = settingGet('api_football_last_full_sync_date') === localToday;
-  const params = fullSyncToday
-    ? { date: localToday, timezone: TZ }
-    : { from: shiftDate(-2), to: shiftDate(2), timezone: TZ };
 
   console.log(`[API_FOOTBALL] Sincronizando ${fullSyncToday ? 'jogos de hoje' : 'janela de 5 dias'}...`);
-  const { rows, remaining } = await apiFetch(params);
+
+  // A API-Football aceita `date` isoladamente. Já `from/to` exigem outros
+  // filtros (ex.: league + season). Para manter o plano Free simples e seguro,
+  // fazemos até 5 consultas por data na primeira sincronização do dia e, nas
+  // demais horas, apenas 1 consulta para a data atual.
+  const datesToFetch = fullSyncToday
+    ? [localToday]
+    : [-2, -1, 0, 1, 2].map((offset) => shiftDate(offset));
+
+  const rowsByFixture = new Map();
+  let remaining = null;
+  let requestCount = 0;
+
+  for (const date of datesToFetch) {
+    const result = await apiFetch({ date, timezone: TZ });
+    requestCount += 1;
+    remaining = result.remaining ?? remaining;
+    for (const fixture of result.rows) {
+      const fixtureId = Number(fixture?.fixture?.id);
+      const key = Number.isFinite(fixtureId) ? String(fixtureId) : JSON.stringify(fixture);
+      if (!rowsByFixture.has(key)) rowsByFixture.set(key, fixture);
+    }
+    // pequena pausa para evitar rajadas no provedor
+    if (datesToFetch.length > 1) await sleep(120);
+  }
+
+  const rows = Array.from(rowsByFixture.values());
   const selected = rows.filter(f => compFor(f.league));
-  console.log(`[API_FOOTBALL] Recebidos=${rows.length}; competições monitoradas=${selected.length}; quota restante=${remaining ?? 'n/d'}.`);
+  console.log(`[API_FOOTBALL] Requests=${requestCount}; recebidos=${rows.length}; competições monitoradas=${selected.length}; quota restante=${remaining ?? 'n/d'}.`);
 
   // Limpa destaques de dados API; serão recalculados com base em hoje.
   db.prepare(`UPDATE matches SET is_featured = 0 WHERE source_provider = 'api_football'`).run();
