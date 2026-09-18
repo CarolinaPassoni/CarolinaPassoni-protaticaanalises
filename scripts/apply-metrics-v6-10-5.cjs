@@ -468,33 +468,25 @@ export const getGeminiApiKey = (): string => {`,
 6. MAPA DE CALOR & TERÇOS: Os campos tercoDefensivo, tercoMedio e tercoOfensivo são EXCLUSIVAMENTE quantitativos. Quando houver evidência suficiente, use APENAS percentual curto no formato "32%". Não coloque descrições qualitativas nesses campos. Se não for possível quantificar, OMITA mapaDeCalor ou o respectivo campo.
 7. INDICADORES AVANÇADOS: NÃO estime xG nem outras métricas avançadas por plausibilidade. Informe xG, grandes chances e passes no terço final somente quando houver medição explícita. Sem evidência, OMITA o campo correspondente; NUNCA use texto de placeholder como valor.`,
     newText: `5. MÉTRICAS DO TRECHO DE VÍDEO:
-   ${useNativeYouTubeVideo ? `
-   O vídeo está sendo analisado nativamente. Para ESTE TRECHO, gere também métricas visuais estimadas:
+   Quando o vídeo estiver disponível nativamente para análise, gere métricas visuais estimadas SOMENTE para ESTE TRECHO:
    - posseDeBola: estime o tempo de controle visível de cada time; os dois percentuais devem somar 100;
    - finalizacoes: conte chutes/tentativas observados, sem duplicar replays;
    - finalizacoesNoAlvo: conte chutes no alvo observados; nunca maior que finalizacoes;
    - escanteios, faltas, impedimentos: conte somente eventos claramente observados.
+   Se não houver evidência visual suficiente, omita a métrica em vez de inventar.
    IMPORTANTE: esses números são do TRECHO analisado, não da partida completa.
-   ` : `
-   Sem vídeo nativo, só preencha métricas quando houver evidência explícita. Caso contrário, omita.
-   `}
 6. MAPA DE CALOR & TERÇOS:
-   ${useNativeYouTubeVideo ? `
-   Faça uma estimativa territorial do TRECHO para cada time, baseada na localização da bola durante suas posses controladas.
+   Quando houver vídeo nativo, faça uma estimativa territorial do TRECHO para cada time, baseada na localização da bola durante suas posses controladas.
    Para cada equipe, tercoDefensivo + tercoMedio + tercoOfensivo deve somar 100%.
    Use apenas percentuais curtos como "28%", "44%", "28%".
-   ` : `
-   Só informe percentuais quando houver evidência visual suficiente.
-   `}
+   Se não houver evidência visual suficiente, omita o mapa.
    Nunca coloque frases qualitativas nos campos dos terços.
 7. INDICADORES AVANÇADOS:
-   ${useNativeYouTubeVideo ? `
+   Quando houver vídeo nativo:
    - grandesChances: conte oportunidades claramente perigosas observadas no TRECHO, sem duplicar replay;
    - xG: forneça um xG IA APROXIMADO DO TRECHO, baseado apenas nas finalizações visíveis (distância, ângulo, pressão e situação do goleiro).
    Este xG NÃO é estatística oficial nem modelo calibrado de provedor externo.
-   ` : `
-   Sem vídeo nativo, informe xG/grandes chances apenas quando houver medição explícita.
-   `}
+   Sem evidência suficiente, omita o campo.
    Nunca use "Não disponível", "N/D" ou texto de placeholder como valor numérico.`,
   },
   {
