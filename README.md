@@ -1,17 +1,11 @@
-# ProTática — versão gratuita Render + Turso
+# ProTática Intelligence
 
-Versão preparada para hospedar o backend/frontend no **Render Free** e manter os dados em um banco **Turso Cloud Free**, sem Persistent Disk pago.
+Versão limpa 6.10.12 para implantação no Render.
 
-## Deploy
-Consulte `DEPLOY_GRATIS_RENDER_TURSO.md`.
+## Publicação
 
-## Banco
-- Produção: Turso remoto por `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`.
-- Desenvolvimento: SQLite local em `./data/protatica.sqlite`.
+- Build: `npm install && npm run build`
+- Inicialização: `npm start`
+- Saúde: `/healthz`
 
-## Comandos
-```bash
-npm install
-npm run build
-npm start
-```
+O código-fonte já contém todas as correções acumuladas até a V6.10.12. Não é necessário executar scripts antigos de atualização.

@@ -42,9 +42,9 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const [resolvingMatchId, setResolvingMatchId] = useState<string | null>(null);
 
   useEffect(() => {
-    const loadHomeData = async () => {
+    const loadHomeData = async (silent = false) => {
       try {
-        setLoadingFeatured(true);
+        if (!silent) setLoadingFeatured(true);
         const [mRes, cRes] = await Promise.all([
           fetch('/api/matches?isFeatured=true'),
           fetch('/api/competitions?onlyActive=true'),
@@ -61,11 +61,13 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       } catch (err) {
         console.error('Error loading home data:', err);
       } finally {
-        setLoadingFeatured(false);
+        if (!silent) setLoadingFeatured(false);
       }
     };
 
     loadHomeData();
+    const refreshTimer = window.setInterval(() => loadHomeData(true), 90 * 1000);
+    return () => window.clearInterval(refreshTimer);
   }, []);
 
 
@@ -256,7 +258,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                   ) : (
                     <div className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-zinc-900/70 border border-zinc-800 text-zinc-400 font-bold text-xs rounded-xl">
                       <Calendar className="w-3.5 h-3.5" />
-                      {match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO'}
+                      {match.status === 'scheduled' ? 'PARTIDA AGENDADA' : match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO'}
                     </div>
                   )}
                 </div>

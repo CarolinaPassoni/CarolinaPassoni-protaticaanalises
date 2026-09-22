@@ -1,7 +1,7 @@
 import React from 'react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
-import { Send, Search, Activity, Target, Flame, Users as UsersIcon, ShieldCheck, Sparkles, Video, MessageSquare } from 'lucide-react';
+import { Send, Search, Activity, Target, Flame, Users as UsersIcon, ShieldCheck, Sparkles, Video, MessageSquare, RefreshCw } from 'lucide-react';
 import type { Analysis, Estatisticas, TeamMetrics } from '../types';
 import PossessionChart from './PossessionChart';
 import ShotsChart from './ShotsChart';
@@ -15,6 +15,8 @@ import { ConfidenceIndexBadge } from './ConfidenceIndexBadge';
 import { ThreeTacticalInsights } from './ThreeTacticalInsights';
 import { VideoEvidenceTimeline } from './VideoEvidenceTimeline';
 import { AskYourGameChat } from './AskYourGameChat';
+import { getAuthHeaders } from '../services/geminiService';
+import { hasValue, normalizeHeatPercent } from '../utils/normalizeAnalysis';
 
 export interface AnalysisDisplayProps {
   analysis: Analysis;
@@ -44,6 +46,7 @@ const loc: Record<string, any> = {
     stadium: 'Estádio',
     referee: 'Árbitro',
     date: 'Data do Jogo',
+    generatedAt: 'Análise gerada em',
     summary: 'Resumo Geral da Partida',
     keyMoments: 'Momentos-Chave',
     tactics: 'Padrões Táticos e Organização',
@@ -145,6 +148,7 @@ const loc: Record<string, any> = {
     stadium: 'Stadium',
     referee: 'Referee',
     date: 'Match Date',
+    generatedAt: 'Analysis generated at',
     summary: 'General Match Summary',
     keyMoments: 'Key Moments',
     tactics: 'Tactical Patterns and Organization',
@@ -246,6 +250,7 @@ const loc: Record<string, any> = {
     stadium: 'Estadio',
     referee: 'Árbitro',
     date: 'Fecha del Partido',
+    generatedAt: 'Análisis generado el',
     summary: 'Resumen General del Partido',
     keyMoments: 'Momentos Clave',
     tactics: 'Patrones Tácticos y Organización',
@@ -397,9 +402,9 @@ const StatisticsTable: React.FC<{ stats: Estatisticas; timeA: string; timeB: str
         <tbody className="divide-y divide-yellow-900/70 print:divide-gray-300">
           {statRows.map((row) => (
             <tr key={row.key} className="text-yellow-101/90 hover:bg-[#4a0404]/80 print:text-black">
-              <td className="p-3 font-mono text-xl text-left">{(stats?.[row.key] as any)?.timeA || '—'}</td>
+              <td className="p-3 font-mono text-xl text-left">{safeMetric((stats?.[row.key] as any)?.timeA)}</td>
               <td className="p-3 font-semibold text-yellow-400/80 print:text-black">{(loc[currentLang] as any)[row.localKey] || row.label}</td>
-              <td className="p-3 font-mono text-xl text-right">{(stats?.[row.key] as any)?.timeB || '—'}</td>
+              <td className="p-3 font-mono text-xl text-right">{safeMetric((stats?.[row.key] as any)?.timeB)}</td>
             </tr>
           ))}
         </tbody>
@@ -418,7 +423,8 @@ const AdvancedMetricsTable: React.FC<{ metrics?: Record<string, TeamMetrics | un
 
   const rows = Object.entries(metrics)
     .filter(([, v]) => {
-      return v && typeof v === 'object' && !Array.isArray(v) && ((v as any).timeA || (v as any).timeB);
+      return v && typeof v === 'object' && !Array.isArray(v) &&
+        (hasValue((v as any).timeA) || hasValue((v as any).timeB));
     })
     .map(([k, v]) => ({ k, v: v as TeamMetrics }));
 
@@ -451,9 +457,9 @@ const AdvancedMetricsTable: React.FC<{ metrics?: Record<string, TeamMetrics | un
         <tbody className="divide-y divide-yellow-900/50">
           {rows.map(({ k, v }) => (
             <tr key={k} className="text-yellow-101/90 hover:bg-[#4a0404]/50">
-              <td className="p-3 font-mono text-left">{v.timeA || '—'}</td>
+              <td className="p-3 font-mono text-left">{safeMetric(v.timeA)}</td>
               <td className="p-3 font-semibold text-yellow-400/80">{labelMap[k] || k}</td>
-              <td className="p-3 font-mono text-right">{v.timeB || '—'}</td>
+              <td className="p-3 font-mono text-right">{safeMetric(v.timeB)}</td>
             </tr>
           ))}
         </tbody>
@@ -501,10 +507,22 @@ const PlayersIcon = () => (
 );
 
 const parsePercent = (val: string) => {
-  return parseFloat(val.replace('%', '')) || 0;
+  if (!hasValue(val)) return 0;
+  return parseFloat(String(val).replace('%', '').replace(',', '.')) || 0;
 };
 const parseIntSimple = (val: string) => {
-  return parseInt(val, 10) || 0;
+  if (!hasValue(val)) return 0;
+  return parseInt(String(val), 10) || 0;
+};
+
+const safeMetric = (value: any, fallback = '—'): string =>
+  hasValue(value) ? String(value).trim() : fallback;
+
+const safePair = (a: any, b: any, fallback = 'Não disponível'): string => {
+  const left = safeMetric(a);
+  const right = safeMetric(b);
+  if (left === '—' && right === '—') return fallback;
+  return `${left} - ${right}`;
 };
 
 // Extractor of all Dynamic Portuguese texts from the Analysis object
@@ -597,6 +615,10 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
   const [isExporting, setIsExporting] = React.useState(false);
   const [exportMessage, setExportMessage] = React.useState('');
   const [isTelegramModalOpen, setIsTelegramModalOpen] = React.useState(false);
+  const [isRecalculatingMetrics, setIsRecalculatingMetrics] = React.useState(false);
+  const [metricsMessage, setMetricsMessage] = React.useState('');
+  const [, setMetricsRevision] = React.useState(0);
+  const automaticCompletionAttemptRef = React.useRef<string | null>(null);
   
   // Translating States
   const [isTranslating, setIsTranslating] = React.useState(false);
@@ -653,6 +675,50 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
     return original;
   };
 
+  const handleRecalculateMetrics = async () => {
+    if (!analysis.analysisId) {
+      setMetricsMessage('Salve a análise antes de recalcular as métricas.');
+      return;
+    }
+
+    setIsRecalculatingMetrics(true);
+    setMetricsMessage('Gemini analisando novamente o trecho para completar métricas, fase ofensiva e fase defensiva...');
+
+    try {
+      const response = await fetch(
+        `/api/analyses/${encodeURIComponent(analysis.analysisId)}/recalculate-metrics`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...getAuthHeaders(),
+          },
+        }
+      );
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Falha ao recalcular métricas.');
+      }
+
+      if (data.analysis) {
+        Object.assign(analysis as any, data.analysis);
+        setMetricsRevision((v) => v + 1);
+      }
+
+      setMetricsMessage(
+        'Métricas e análise tática do trecho recalculadas e salvas. Posse, mapa de calor, fase ofensiva e fase defensiva foram atualizados a partir do vídeo.'
+      );
+    } catch (err: any) {
+      setMetricsMessage(
+        err?.message || 'Não foi possível recalcular as métricas agora.'
+      );
+    } finally {
+      setIsRecalculatingMetrics(false);
+    }
+  };
+
   const handleExportPDF = async () => {
     setIsExporting(true);
     setExportMessage(loc[currentLang].preparing || 'Preparando...');
@@ -674,9 +740,20 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
   const teamBName = analysis.timeB || 'Time B';
 
   const possessionData = [
-    { name: teamAName, value: parsePercent(analysis.estatisticas?.posseDeBola?.timeA || '0%') },
-    { name: teamBName, value: parsePercent(analysis.estatisticas?.posseDeBola?.timeB || '0%') },
+    { name: teamAName, value: parsePercent(analysis.estatisticas?.posseDeBola?.timeA || '') },
+    { name: teamBName, value: parsePercent(analysis.estatisticas?.posseDeBola?.timeB || '') },
   ];
+
+  const heatmapA = analysis.estatisticas?.mapaDeCalor?.timeA;
+  const heatmapB = analysis.estatisticas?.mapaDeCalor?.timeB;
+  const hasHeatmapThirds = Boolean(
+    normalizeHeatPercent(heatmapA?.tercoDefensivo) ||
+    normalizeHeatPercent(heatmapA?.tercoMedio) ||
+    normalizeHeatPercent(heatmapA?.tercoOfensivo) ||
+    normalizeHeatPercent(heatmapB?.tercoDefensivo) ||
+    normalizeHeatPercent(heatmapB?.tercoMedio) ||
+    normalizeHeatPercent(heatmapB?.tercoOfensivo)
+  );
 
   const shotsData = [
     {
@@ -690,6 +767,57 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
       [teamBName]: parseIntSimple(analysis.estatisticas?.finalizacoesNoAlvo?.timeB || '0'),
     },
   ];
+
+  const metricsAudit = analysis.verificacaoAuditoria as any;
+  const metricsEstimated = metricsAudit?.metricasOrigem === 'estimativa_visual_trecho';
+  const hasDefensiveTacticalAnalysis = Boolean(
+    hasValue(analysis.faseDefensiva?.timeA?.posicionamento) &&
+    hasValue(analysis.faseDefensiva?.timeA?.compactacao_pressao) &&
+    hasValue(analysis.faseDefensiva?.timeA?.transicao) &&
+    hasValue(analysis.faseDefensiva?.timeB?.posicionamento) &&
+    hasValue(analysis.faseDefensiva?.timeB?.compactacao_pressao) &&
+    hasValue(analysis.faseDefensiva?.timeB?.transicao)
+  );
+
+  const hasOffensiveTacticalAnalysis = Boolean(
+    hasValue(analysis.faseOfensiva?.timeA?.saidaDeBola) &&
+    hasValue(analysis.faseOfensiva?.timeA?.criacao) &&
+    hasValue(analysis.faseOfensiva?.timeA?.finalizacao_movimentacao) &&
+    hasValue(analysis.faseOfensiva?.timeB?.saidaDeBola) &&
+    hasValue(analysis.faseOfensiva?.timeB?.criacao) &&
+    hasValue(analysis.faseOfensiva?.timeB?.finalizacao_movimentacao)
+  );
+
+  const needsMetricRecalc = Boolean(
+    analysis.analysisId &&
+    analysis.videoUrl &&
+    (
+      !hasValue(analysis.estatisticas?.posseDeBola?.timeA) ||
+      !hasValue(analysis.estatisticas?.posseDeBola?.timeB) ||
+      !hasValue(analysis.estatisticas?.finalizacoes?.timeA) ||
+      !hasValue(analysis.estatisticas?.finalizacoes?.timeB) ||
+      !hasValue(analysis.estatisticas?.finalizacoesNoAlvo?.timeA) ||
+      !hasValue(analysis.estatisticas?.finalizacoesNoAlvo?.timeB) ||
+      !hasValue(analysis.indicadoresAvancados?.xG?.timeA) ||
+      !hasValue(analysis.indicadoresAvancados?.xG?.timeB) ||
+      !hasValue(analysis.indicadoresAvancados?.grandesChances?.timeA) ||
+      !hasValue(analysis.indicadoresAvancados?.grandesChances?.timeB) ||
+      !hasHeatmapThirds ||
+      !hasDefensiveTacticalAnalysis ||
+      !hasOffensiveTacticalAnalysis
+    )
+  );
+
+  // Análises antigas incompletas são complementadas automaticamente ao abrir.
+  // Uma tentativa por montagem evita chamadas duplicadas ou loop em caso de falha.
+  React.useEffect(() => {
+    const analysisId = String(analysis.analysisId || '').trim();
+    if (!needsMetricRecalc || !analysisId || isRecalculatingMetrics) return;
+    if (automaticCompletionAttemptRef.current === analysisId) return;
+
+    automaticCompletionAttemptRef.current = analysisId;
+    void handleRecalculateMetrics();
+  }, [analysis.analysisId, needsMetricRecalc]);
 
   const contexto = analysis.contextoPartida;
   const verificacao = analysis.verificacaoAuditoria;
@@ -782,6 +910,27 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
         </div>
       </div>
 
+      {metricsMessage && (
+        <div
+          data-html2canvas-ignore="true"
+          className="rounded-xl border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-200 print:hidden"
+        >
+          {metricsMessage}
+        </div>
+      )}
+
+      {metricsEstimated && (
+        <div className="rounded-xl border border-sky-900/40 bg-sky-950/20 px-4 py-3 text-sm text-sky-100">
+          <div className="font-bold">Métricas estimadas a partir do vídeo</div>
+          <div className="mt-1 text-xs text-sky-200/75">
+            Referem-se somente ao trecho {metricsAudit?.metricasTrecho || 'analisado'}.
+            Posse, mapa territorial e xG são estimativas visuais do Gemini; não representam
+            estatísticas oficiais da partida completa.
+            {metricsAudit?.metricasConfianca ? ` Confiança da leitura: ${metricsAudit.metricasConfianca}%.` : ''}
+          </div>
+        </div>
+      )}
+
       {/* TRANSLATION LOADING HUD */}
       {isTranslating && (
         <div data-html2canvas-ignore="true" className="bg-yellow-900/30 text-yellow-300 px-4 py-2 text-xs font-semibold rounded-lg flex items-center gap-2 animate-pulse justify-center border border-yellow-800/30">
@@ -824,7 +973,7 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
             <div className="mt-3 flex flex-wrap justify-center gap-3 text-xs text-yellow-301/70">
               {analysis.videoId && <span className="px-2 py-1 rounded-full border border-yellow-900/40 bg-black/20 font-mono">Video ID: {analysis.videoId}</span>}
               {analysis.analysisId && <span className="px-2 py-1 rounded-full border border-yellow-900/40 bg-black/20">ID: {analysis.analysisId}</span>}
-              {analysis.createdAt && <span className="px-2 py-1 rounded-full border border-yellow-900/40 bg-black/20">{loc[currentLang].date}: {formatDateTime(analysis.createdAt)}</span>}
+              {analysis.createdAt && <span className="px-2 py-1 rounded-full border border-yellow-900/40 bg-black/20">{loc[currentLang].generatedAt}: {formatDateTime(analysis.createdAt)}</span>}
             </div>
           )}
         </div>
@@ -1058,6 +1207,11 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
 
           {/* DEFENSIVE PHASES */}
           <AnalysisCard title={loc[currentLang].defendingPhase} icon={<TacticIcon />}>
+            {!hasDefensiveTacticalAnalysis && (
+              <div className="mb-5 rounded-xl border border-amber-800/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
+                O sistema está completando automaticamente a fase defensiva a partir do trecho do vídeo.
+              </div>
+            )}
             <div className="grid md:grid-cols-2 gap-8">
               <div className="space-y-4">
                 <SectionTitle>{analysis.timeA}</SectionTitle>
@@ -1076,6 +1230,11 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
 
           {/* OFFENSIVE PHASES */}
           <AnalysisCard title={loc[currentLang].offensivePhase} icon={<TacticIcon />}>
+            {!hasOffensiveTacticalAnalysis && (
+              <div className="mb-5 rounded-xl border border-amber-800/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
+                O sistema está completando automaticamente a fase ofensiva a partir do trecho do vídeo.
+              </div>
+            )}
             <div className="grid md:grid-cols-2 gap-8">
               <div className="space-y-4">
                 <SectionTitle>{analysis.timeA}</SectionTitle>
@@ -1187,7 +1346,7 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-5 text-center">
                 <span className="text-yellow-300 font-bold text-lg block">{analysis.timeA}</span>
                 <span className="text-4xl md:text-5xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {analysis.estatisticas?.posseDeBola?.timeA || 'N/D'}
+                  {safeMetric(analysis.estatisticas?.posseDeBola?.timeA, 'Não disponível')}
                 </span>
                 <span className="text-xs text-yellow-400/70 uppercase tracking-wider font-semibold mt-1 block">
                   {loc[currentLang].posseDeBola}
@@ -1196,7 +1355,7 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-5 text-center">
                 <span className="text-yellow-300 font-bold text-lg block">{analysis.timeB}</span>
                 <span className="text-4xl md:text-5xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {analysis.estatisticas?.posseDeBola?.timeB || 'N/D'}
+                  {safeMetric(analysis.estatisticas?.posseDeBola?.timeB, 'Não disponível')}
                 </span>
                 <span className="text-xs text-yellow-400/70 uppercase tracking-wider font-semibold mt-1 block">
                   {loc[currentLang].posseDeBola}
@@ -1252,28 +1411,28 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-4 text-center">
                 <span className="text-xs text-yellow-400/80 uppercase font-semibold block">{loc[currentLang].finalizacoes}</span>
                 <span className="text-2xl md:text-3xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {(analysis.estatisticas?.finalizacoes?.timeA || '0')} - {(analysis.estatisticas?.finalizacoes?.timeB || '0')}
+                  {safePair(analysis.estatisticas?.finalizacoes?.timeA, analysis.estatisticas?.finalizacoes?.timeB)}
                 </span>
                 <span className="text-[11px] text-yellow-300/60 mt-1 block truncate">{analysis.timeA} vs {analysis.timeB}</span>
               </div>
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-4 text-center">
                 <span className="text-xs text-yellow-400/80 uppercase font-semibold block">{loc[currentLang].finalizacoesNoAlvo}</span>
                 <span className="text-2xl md:text-3xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {(analysis.estatisticas?.finalizacoesNoAlvo?.timeA || '0')} - {(analysis.estatisticas?.finalizacoesNoAlvo?.timeB || '0')}
+                  {safePair(analysis.estatisticas?.finalizacoesNoAlvo?.timeA, analysis.estatisticas?.finalizacoesNoAlvo?.timeB)}
                 </span>
                 <span className="text-[11px] text-yellow-300/60 mt-1 block truncate">{analysis.timeA} vs {analysis.timeB}</span>
               </div>
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-4 text-center">
-                <span className="text-xs text-yellow-400/80 uppercase font-semibold block">{loc[currentLang].xG || 'xG'}</span>
+                <span className="text-xs text-yellow-400/80 uppercase font-semibold block">{metricsEstimated ? 'xG estimado (IA)' : (loc[currentLang].xG || 'xG')}</span>
                 <span className="text-2xl md:text-3xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {(analysis.indicadoresAvancados?.xG?.timeA || '—')} - {(analysis.indicadoresAvancados?.xG?.timeB || '—')}
+                  {safePair(analysis.indicadoresAvancados?.xG?.timeA, analysis.indicadoresAvancados?.xG?.timeB)}
                 </span>
                 <span className="text-[11px] text-yellow-300/60 mt-1 block truncate">{analysis.timeA} vs {analysis.timeB}</span>
               </div>
               <div className="bg-[#4a0404]/50 border border-yellow-900/60 rounded-xl p-4 text-center">
                 <span className="text-xs text-yellow-400/80 uppercase font-semibold block">{loc[currentLang].grandesChances || 'Chances'}</span>
                 <span className="text-2xl md:text-3xl font-extrabold text-yellow-100 font-mono mt-1 block">
-                  {(analysis.indicadoresAvancados?.grandesChances?.timeA || '—')} - {(analysis.indicadoresAvancados?.grandesChances?.timeB || '—')}
+                  {safePair(analysis.indicadoresAvancados?.grandesChances?.timeA, analysis.indicadoresAvancados?.grandesChances?.timeB)}
                 </span>
                 <span className="text-[11px] text-yellow-300/60 mt-1 block truncate">{analysis.timeA} vs {analysis.timeB}</span>
               </div>
@@ -1335,7 +1494,7 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
             </div>
 
             {/* THIRDS DISTRIBUTION METRICS */}
-            {analysis.estatisticas?.mapaDeCalor?.timeA && (
+            {hasHeatmapThirds && (
               <div className="mt-8">
                 <SectionTitle>{loc[currentLang].heatmapTer}</SectionTitle>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
@@ -1344,12 +1503,12 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
                     <div className="flex justify-around items-center mt-3 text-lg font-mono font-bold text-yellow-100">
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeA}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeA.tercoDefensivo || '—'}
+                        {normalizeHeatPercent(heatmapA?.tercoDefensivo) || '—'}
                       </div>
                       <div className="text-yellow-600">vs</div>
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeB}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeB?.tercoDefensivo || '—'}
+                        {normalizeHeatPercent(heatmapB?.tercoDefensivo) || '—'}
                       </div>
                     </div>
                   </div>
@@ -1359,12 +1518,12 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
                     <div className="flex justify-around items-center mt-3 text-lg font-mono font-bold text-yellow-100">
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeA}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeA.tercoMedio || '—'}
+                        {normalizeHeatPercent(heatmapA?.tercoMedio) || '—'}
                       </div>
                       <div className="text-yellow-600">vs</div>
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeB}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeB?.tercoMedio || '—'}
+                        {normalizeHeatPercent(heatmapB?.tercoMedio) || '—'}
                       </div>
                     </div>
                   </div>
@@ -1374,12 +1533,12 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
                     <div className="flex justify-around items-center mt-3 text-lg font-mono font-bold text-yellow-100">
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeA}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeA.tercoOfensivo || '—'}
+                        {normalizeHeatPercent(heatmapA?.tercoOfensivo) || '—'}
                       </div>
                       <div className="text-yellow-600">vs</div>
                       <div>
                         <span className="text-xs text-yellow-300 block">{analysis.timeB}</span>
-                        {analysis.estatisticas.mapaDeCalor.timeB?.tercoOfensivo || '—'}
+                        {normalizeHeatPercent(heatmapB?.tercoOfensivo) || '—'}
                       </div>
                     </div>
                   </div>

@@ -4,7 +4,7 @@ import path, { join } from 'path';
 import { randomUUID, randomBytes, createHash } from 'crypto';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import multer from 'multer';
 import { normalizeAnalysisResponse } from './src/utils/normalizeAnalysis.js';
 import { generateAnalysisPdf, sanitizeFilename, getAnalysisPdfFilename } from './src/services/pdfService.js';
@@ -12,6 +12,7 @@ import {
   saveAnalysis,
   listAnalyses,
   getAnalysisById,
+  updateAnalysisPayload,
   getPublicAnalysisById,
   enrichAnalysisFromDb,
   verifyUserCredentials,
@@ -128,7 +129,11 @@ const upload = multer({
 });
 
 const VALID_MODELS = new Set([
+  'gemini-3.8-flash',
   'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
   'gemini-3.7-pro',
   'gemini-2.0-flash',
   'gemini-3.1-flash-lite',
@@ -136,24 +141,766 @@ const VALID_MODELS = new Set([
 ]);
 
 const sanitizeModelName = (modelName?: string): string => {
-  if (!modelName) return 'gemini-3.7-flash';
+  if (!modelName) return 'gemini-3.8-flash';
   let m = modelName.trim();
   if (m.startsWith('models/')) {
     m = m.replace(/^models\//, '');
   }
   if (m.startsWith('AQ.') || m.startsWith('AIza') || !m.startsWith('gemini-')) {
-    return 'gemini-3.7-flash';
+    return 'gemini-3.8-flash';
   }
-  if (m === 'gemini-2.5-flash' || m === 'gemini-3.6-flash' || m === 'gemini-1.5-flash' || m === 'gemini-1.5-pro' || m === 'gemini-3.5-flash') {
-    return 'gemini-3.7-flash';
+  if (m === 'gemini-1.5-flash' || m === 'gemini-1.5-pro') {
+    return 'gemini-3.8-flash';
   }
-  if (VALID_MODELS.has(m) || m.startsWith('gemini-3.7-') || m.startsWith('gemini-2.0-')) {
+  if (
+    VALID_MODELS.has(m) ||
+    m.startsWith('gemini-3.8-') ||
+    m.startsWith('gemini-3.7-') ||
+    m.startsWith('gemini-3.6-') ||
+    m.startsWith('gemini-2.0-')
+  ) {
     return m;
   }
-  return 'gemini-3.7-flash';
+  return 'gemini-3.8-flash';
 };
 
 export const GEMINI_MODEL = sanitizeModelName(process.env.GEMINI_MODEL);
+export const GEMINI_FALLBACK_MODEL = sanitizeModelName(
+  process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash'
+);
+export const GEMINI_ENABLE_SECONDARY_SEARCH =
+  String(process.env.GEMINI_ENABLE_SECONDARY_SEARCH || '').trim().toLowerCase() === 'true';
+
+const getGeminiFailoverPlan = (primaryModel?: string): string[] => {
+  const primary = sanitizeModelName(primaryModel || GEMINI_MODEL);
+
+  return Array.from(
+    new Set(
+      [
+        'gemini-3.6-flash',
+        'gemini-3.5-flash-lite',
+        'gemini-3.5-flash',
+        GEMINI_FALLBACK_MODEL,
+        primary,
+      ]
+        .map((model) => sanitizeModelName(model))
+        .filter(Boolean)
+    )
+  );
+};
+
+const adaptGeminiRequestForModel = (request: any, model: string): any => {
+  const next = {
+    ...request,
+    model,
+    config: request?.config ? { ...request.config } : undefined,
+  };
+
+  if (!next.config) return next;
+
+  // Gemini 2.5 usa thinkingBudget; thinkingLevel é exclusivo dos modelos 3+.
+  if (model.startsWith('gemini-2.5-') && next.config.thinkingConfig) {
+    const current = next.config.thinkingConfig || {};
+    const level = String(current.thinkingLevel || '').toUpperCase();
+
+    let thinkingBudget = 2048;
+    if (level === 'MINIMAL') thinkingBudget = 512;
+    if (level === 'LOW') thinkingBudget = 1024;
+    if (level === 'MEDIUM') thinkingBudget = 4096;
+    if (level === 'HIGH') thinkingBudget = 8192;
+
+    next.config = {
+      ...next.config,
+      thinkingConfig: {
+        thinkingBudget,
+      },
+    };
+  }
+
+  return next;
+};
+
+const geminiDelay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const geminiBackoffDelay = async (attempt: number): Promise<void> => {
+  const baseMs = Math.min(8000, 1000 * (2 ** Math.max(0, attempt - 1)));
+  const jitterMs = Math.floor(Math.random() * 750);
+  await geminiDelay(baseMs + jitterMs);
+};
+
+const getGeminiErrorCode = (err: any): number => {
+  const direct = Number(
+    err?.status ??
+    err?.code ??
+    err?.error?.code ??
+    err?.response?.status
+  );
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const message = String(err?.message || err || '');
+  const match = message.match(/"code"\s*:\s*(\d{3})/) || message.match(/\b(429|500|502|503|504)\b/);
+  return match ? Number(match[1]) : 0;
+};
+
+const isTransientGeminiError = (err: any): boolean => {
+  const code = getGeminiErrorCode(err);
+  if ([429, 500, 502, 503, 504].includes(code)) return true;
+  const message = String(err?.message || err || '').toLowerCase();
+  return /fetch failed|network|timeout|socket|econnreset|etimedout/.test(message);
+};
+
+
+const geminiModelCooldownUntil = new Map<string, number>();
+
+const getGeminiRetryAfterSeconds = (err: any): number => {
+  const message = String(err?.message || err?.cause?.message || err || '');
+
+  // Cota diária do Free Tier: não continuar queimando chamadas no mesmo modelo.
+  if (/PerDayPerProjectPerModel|GenerateRequestsPerDayPerProjectPerModel/i.test(message)) {
+    const now = new Date();
+    const nextUtcDay = Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() + 1,
+      0, 1, 0
+    );
+    return Math.max(60, Math.ceil((nextUtcDay - Date.now()) / 1000));
+  }
+
+  const retryInfo =
+    message.match(/retryDelay[^0-9]*(\d+)s/i) ||
+    message.match(/retry in\s+([0-9.]+)s/i);
+
+  if (retryInfo) {
+    return Math.max(5, Math.ceil(Number(retryInfo[1]) || 0));
+  }
+
+  const code = getGeminiErrorCode(err);
+  if (code === 429) return 60;
+  if ([500, 502, 503, 504].includes(code)) return 45;
+
+  return 45;
+};
+
+const setGeminiModelCooldown = (model: string, err: any) => {
+  const seconds = getGeminiRetryAfterSeconds(err);
+  geminiModelCooldownUntil.set(model, Date.now() + seconds * 1000);
+  console.warn(
+    `[GEMINI_COOLDOWN] model=${model} seconds=${seconds} code=${getGeminiErrorCode(err) || 'unknown'}`
+  );
+};
+
+const getGeminiNextRetrySeconds = (): number => {
+  const now = Date.now();
+  const waits = Array.from(geminiModelCooldownUntil.values())
+    .filter((until) => until > now)
+    .map((until) => Math.ceil((until - now) / 1000));
+
+  return waits.length ? Math.max(5, Math.min(...waits)) : 45;
+};
+
+const generateGeminiResilient = async (
+  ai: GoogleGenAI,
+  request: any,
+  label: string
+): Promise<{ response: any; modelUsed: string }> => {
+  const primary = sanitizeModelName(String(request?.model || GEMINI_MODEL));
+  const modelPlan = getGeminiFailoverPlan(primary);
+
+  let lastError: any = null;
+
+  // Primeira rodada: troca IMEDIATAMENTE de modelo em 429/503/timeout.
+  // Segunda rodada: só acontece se todos os modelos falharem.
+  for (let round = 1; round <= 2; round++) {
+    if (round === 2) {
+      await geminiBackoffDelay(round);
+      console.warn(
+        `[GEMINI_FAILOVER] label=${label} iniciando segunda rodada após falha de todos os modelos`
+      );
+    }
+
+    for (const model of modelPlan) {
+      const cooldownUntil = geminiModelCooldownUntil.get(model) || 0;
+      if (cooldownUntil > Date.now()) {
+        const remaining = Math.ceil((cooldownUntil - Date.now()) / 1000);
+        console.warn(
+          `[GEMINI_COOLDOWN] skip model=${model} remaining=${remaining}s label=${label}`
+        );
+        continue;
+      }
+
+      try {
+        const adaptedRequest = adaptGeminiRequestForModel(request, model);
+        const response = await ai.models.generateContent(adaptedRequest);
+
+        console.log(
+          `[GEMINI_FAILOVER] label=${label} success=true model=${model} round=${round}`
+        );
+
+        return { response, modelUsed: model };
+      } catch (err: any) {
+        lastError = err;
+        const code = getGeminiErrorCode(err);
+        const transient = isTransientGeminiError(err);
+
+        console.warn(
+          `[GEMINI_FAILOVER] label=${label} success=false model=${model} round=${round} code=${code || 'unknown'} transient=${transient}`
+        );
+
+        // Em 429/503/timeout, coloca o modelo em cooldown e segue.
+        if (transient) {
+          setGeminiModelCooldown(model, err);
+          continue;
+        }
+
+        // Erro específico de compatibilidade de um modelo: tenta o próximo.
+        const message = String(err?.message || err || '').toLowerCase();
+        const modelSpecific =
+          /thinkinglevel|thinkingbudget|unsupported|not supported|model.*not found|invalid model|not available|no longer available|not_found|\b404\b/.test(message);
+
+        if (modelSpecific) continue;
+
+        // Erros de requisição que afetariam todos os modelos não devem gerar
+        // quatro chamadas iguais.
+        throw err;
+      }
+    }
+  }
+
+  const finalError: any = new Error(
+    'A inteligência artificial está temporariamente indisponível após tentativas em múltiplos modelos.'
+  );
+  finalError.code = 'GEMINI_TEMPORARILY_UNAVAILABLE';
+  finalError.status = getGeminiErrorCode(lastError) || 503;
+  finalError.retryAfterSeconds = getGeminiNextRetrySeconds();
+  finalError.cause = lastError;
+  throw finalError;
+};
+
+const SEGMENT_METRICS_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    posseDeBola: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: { type: Type.NUMBER },
+        timeB: { type: Type.NUMBER },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    finalizacoes: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: { type: Type.NUMBER },
+        timeB: { type: Type.NUMBER },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    finalizacoesNoAlvo: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: { type: Type.NUMBER },
+        timeB: { type: Type.NUMBER },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    grandesChances: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: { type: Type.NUMBER },
+        timeB: { type: Type.NUMBER },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    xGEstimado: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: { type: Type.NUMBER },
+        timeB: { type: Type.NUMBER },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    mapaDeCalor: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: {
+          type: Type.OBJECT,
+          properties: {
+            tercoDefensivo: { type: Type.NUMBER },
+            tercoMedio: { type: Type.NUMBER },
+            tercoOfensivo: { type: Type.NUMBER },
+          },
+          required: ['tercoDefensivo', 'tercoMedio', 'tercoOfensivo'],
+        },
+        timeB: {
+          type: Type.OBJECT,
+          properties: {
+            tercoDefensivo: { type: Type.NUMBER },
+            tercoMedio: { type: Type.NUMBER },
+            tercoOfensivo: { type: Type.NUMBER },
+          },
+          required: ['tercoDefensivo', 'tercoMedio', 'tercoOfensivo'],
+        },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    faseDefensiva: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: {
+          type: Type.OBJECT,
+          properties: {
+            posicionamento: { type: Type.STRING },
+            compactacao_pressao: { type: Type.STRING },
+            transicao: { type: Type.STRING },
+          },
+          required: ['posicionamento', 'compactacao_pressao', 'transicao'],
+        },
+        timeB: {
+          type: Type.OBJECT,
+          properties: {
+            posicionamento: { type: Type.STRING },
+            compactacao_pressao: { type: Type.STRING },
+            transicao: { type: Type.STRING },
+          },
+          required: ['posicionamento', 'compactacao_pressao', 'transicao'],
+        },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    faseOfensiva: {
+      type: Type.OBJECT,
+      properties: {
+        timeA: {
+          type: Type.OBJECT,
+          properties: {
+            saidaDeBola: { type: Type.STRING },
+            criacao: { type: Type.STRING },
+            finalizacao_movimentacao: { type: Type.STRING },
+          },
+          required: ['saidaDeBola', 'criacao', 'finalizacao_movimentacao'],
+        },
+        timeB: {
+          type: Type.OBJECT,
+          properties: {
+            saidaDeBola: { type: Type.STRING },
+            criacao: { type: Type.STRING },
+            finalizacao_movimentacao: { type: Type.STRING },
+          },
+          required: ['saidaDeBola', 'criacao', 'finalizacao_movimentacao'],
+        },
+      },
+      required: ['timeA', 'timeB'],
+    },
+    confianca: { type: Type.NUMBER },
+    observacoes: { type: Type.STRING },
+  },
+  required: [
+    'posseDeBola',
+    'finalizacoes',
+    'finalizacoesNoAlvo',
+    'grandesChances',
+    'xGEstimado',
+    'mapaDeCalor',
+    'faseDefensiva',
+    'faseOfensiva',
+    'confianca',
+    'observacoes',
+  ],
+};
+
+const clampNumber = (value: any, min: number, max: number): number => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
+};
+
+const normalizePair100 = (aRaw: any, bRaw: any): [number, number] => {
+  const a = Math.max(0, Number(aRaw) || 0);
+  const b = Math.max(0, Number(bRaw) || 0);
+  const total = a + b;
+
+  if (total <= 0) return [50, 50];
+
+  const aPct = Math.round((a / total) * 100);
+  return [aPct, 100 - aPct];
+};
+
+const normalizeTriple100 = (xRaw: any, yRaw: any, zRaw: any): [number, number, number] => {
+  const x = Math.max(0, Number(xRaw) || 0);
+  const y = Math.max(0, Number(yRaw) || 0);
+  const z = Math.max(0, Number(zRaw) || 0);
+  const total = x + y + z;
+
+  if (total <= 0) return [33, 34, 33];
+
+  const a = Math.round((x / total) * 100);
+  const b = Math.round((y / total) * 100);
+  const c = 100 - a - b;
+
+  return [Math.max(0, a), Math.max(0, b), Math.max(0, c)];
+};
+
+const parseAnalysisSegmentRange = (analysis: any): { startSec: number; endSec: number } => {
+  const raw = String(
+    analysis?.verificacaoAuditoria?.trechoAnalisado ||
+    analysis?.verificacaoAuditoria?.segmentosAnalisados ||
+    ''
+  );
+
+  const match = raw.match(/(\d+)s\s*-\s*(\d+)s/i);
+  let startSec = match ? Number(match[1]) : 0;
+  let endSec = match ? Number(match[2]) : 300;
+
+  if (!Number.isFinite(startSec) || startSec < 0) startSec = 0;
+  if (!Number.isFinite(endSec) || endSec <= startSec) endSec = startSec + 300;
+
+  // O recálculo é uma etapa de métricas, não uma segunda análise tática completa.
+  // Limitamos a 15 min por chamada para preservar estabilidade/cota.
+  endSec = Math.min(endSec, startSec + 900);
+
+  return { startSec, endSec };
+};
+
+const extractSegmentMetricsFromVideo = async ({
+  apiKey,
+  videoUrl,
+  timeA,
+  timeB,
+  startSec,
+  endSec,
+}: {
+  apiKey: string;
+  videoUrl: string;
+  timeA: string;
+  timeB: string;
+  startSec: number;
+  endSec: number;
+}) => {
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: { 'User-Agent': 'aistudio-build' },
+      timeout: 600000,
+    },
+  });
+
+  const duration = Math.max(1, endSec - startSec);
+  const fps = duration <= 300 ? 1 : 0.5;
+
+  const prompt = `
+Você é o módulo de métricas visuais do ProTática.
+
+Analise SOMENTE o trecho do vídeo entre ${startSec}s e ${endSec}s.
+Times:
+- Time A: ${timeA}
+- Time B: ${timeB}
+
+OBJETIVO:
+Gerar métricas DO TRECHO ANALISADO, e não da partida inteira.
+
+REGRAS:
+1. POSSE DE BOLA:
+   - estime o tempo de controle visível de cada equipe durante jogo ativo;
+   - ignore replays, intervalos longos, tela de escalação e interrupções sem bola em jogo;
+   - retorne dois números percentuais que somem 100.
+
+2. FINALIZAÇÕES:
+   - conte tentativas de chute observadas no trecho;
+   - não duplique um lance quando a transmissão mostrar replay;
+   - finalizações no alvo nunca podem ser maiores que finalizações.
+
+3. GRANDES CHANCES:
+   - conte somente oportunidades claramente perigosas observadas no trecho;
+   - não duplique replays.
+
+4. xG ESTIMADO IA:
+   - isto NÃO é xG oficial;
+   - estime apenas a partir das finalizações observadas, considerando distância, ângulo, pressão, tipo de assistência e situação do goleiro;
+   - some os valores aproximados por equipe;
+   - use valor decimal entre 0 e 5.
+
+5. MAPA POR TERÇOS:
+   - estime, para cada equipe, em que terço do campo a bola esteve durante SUAS posses controladas;
+   - os três valores de cada equipe devem somar 100;
+   - considere o sentido de ataque de cada time no trecho;
+   - terço defensivo = próximo ao próprio gol;
+   - terço ofensivo = próximo ao gol adversário.
+
+6. FASE DEFENSIVA DO TRECHO:
+   Para CADA equipe, descreva com base no que é VISUALMENTE observado:
+   - posicionamento: altura do bloco, largura/profundidade, linha defensiva, proteção de área e comportamento sem bola;
+   - compactacao_pressao: distância entre setores, intensidade e gatilhos de pressão, encaixes, coberturas e comportamento após passe adversário;
+   - transicao: reação imediatamente após perder/recuperar a bola, recomposição, proteção de profundidade e contra-pressão.
+   Cada campo deve ter uma descrição objetiva de pelo menos 2 frases.
+   NÃO escreva "não disponível", "evidência insuficiente" ou equivalente. Descreva somente tendências realmente observadas no trecho.
+
+7. FASE OFENSIVA DO TRECHO:
+   Para CADA equipe, descreva:
+   - saidaDeBola: estrutura de primeira fase, participação do goleiro/zagueiros/laterais e forma de superar a primeira pressão;
+   - criacao: progressão, ocupação de corredores, entrelinhas, amplitude, apoios e padrões de combinação;
+   - finalizacao_movimentacao: chegada ao último terço, ataques à área, movimentos de ruptura, cruzamentos e forma de criação das finalizações.
+   Cada campo deve ter uma descrição objetiva de pelo menos 2 frases.
+   NÃO escreva "não disponível". Use somente comportamentos observados no trecho.
+
+8. CONFIANÇA:
+   - 0 a 100, refletindo qualidade visual e clareza para contar/estimar as métricas e comportamentos táticos.
+
+9. NÃO use estatísticas externas da partida.
+10. NÃO use memória de outros jogos.
+11. Todos os números e descrições referem-se SOMENTE ao trecho ${startSec}s–${endSec}s.
+12. Retorne apenas o JSON do schema solicitado.
+`;
+
+  const models = getGeminiFailoverPlan(GEMINI_MODEL);
+
+  let lastError: any = null;
+
+  for (const model of models) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          {
+            fileData: {
+              fileUri: videoUrl,
+              mimeType: 'video/*',
+            },
+            videoMetadata: {
+              startOffset: `${Math.floor(startSec)}s`,
+              endOffset: `${Math.floor(endSec)}s`,
+              fps,
+            },
+          },
+          { text: prompt },
+        ],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: SEGMENT_METRICS_SCHEMA,
+          maxOutputTokens: 4096,
+        },
+      });
+
+      const text = String((response as any)?.text || '').trim();
+      if (!text) throw new Error('Gemini não retornou métricas.');
+
+      const parsed = JSON.parse(text);
+      return { data: parsed, modelUsed: model };
+    } catch (err: any) {
+      lastError = err;
+      const code = getGeminiErrorCode(err);
+      const message = String(err?.message || err);
+
+      console.warn(
+        `[SEGMENT_METRICS] model=${model} success=false code=${code || 'unknown'} error=${message.slice(0, 220)}`
+      );
+
+      // 429/503/timeout: passa imediatamente para o próximo modelo.
+      if (isTransientGeminiError(err)) continue;
+
+      // Se um modelo específico não suportar a configuração, tenta o próximo.
+      if (/unsupported|not supported|model.*not found|invalid model|not available|no longer available|not_found|\b404\b/i.test(message)) continue;
+    }
+  }
+
+  throw lastError || new Error('Não foi possível calcular as métricas do trecho.');
+};
+
+const cleanTacticalSupplementText = (value: any): string | undefined => {
+  const clean = String(value || '').trim();
+  if (!clean) return undefined;
+
+  const normalized = clean
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (
+    normalized.includes('nao disponivel') ||
+    normalized.includes('indisponivel') ||
+    normalized.includes('nao identificado') ||
+    normalized.includes('evidencia insuficiente') ||
+    normalized === 'n/d'
+  ) {
+    return undefined;
+  }
+
+  return clean.length >= 12 ? clean : undefined;
+};
+
+const applySegmentMetricsToAnalysis = (
+  analysis: any,
+  metrics: any,
+  startSec: number,
+  endSec: number,
+  modelUsed: string
+) => {
+  const [posA, posB] = normalizePair100(
+    metrics?.posseDeBola?.timeA,
+    metrics?.posseDeBola?.timeB
+  );
+
+  const shotsA = Math.max(0, Math.round(Number(metrics?.finalizacoes?.timeA) || 0));
+  const shotsB = Math.max(0, Math.round(Number(metrics?.finalizacoes?.timeB) || 0));
+
+  const targetA = Math.min(
+    shotsA,
+    Math.max(0, Math.round(Number(metrics?.finalizacoesNoAlvo?.timeA) || 0))
+  );
+  const targetB = Math.min(
+    shotsB,
+    Math.max(0, Math.round(Number(metrics?.finalizacoesNoAlvo?.timeB) || 0))
+  );
+
+  const bigA = Math.min(
+    shotsA,
+    Math.max(0, Math.round(Number(metrics?.grandesChances?.timeA) || 0))
+  );
+  const bigB = Math.min(
+    shotsB,
+    Math.max(0, Math.round(Number(metrics?.grandesChances?.timeB) || 0))
+  );
+
+  const xgA = clampNumber(metrics?.xGEstimado?.timeA, 0, 5);
+  const xgB = clampNumber(metrics?.xGEstimado?.timeB, 0, 5);
+
+  const [aDef, aMid, aAtt] = normalizeTriple100(
+    metrics?.mapaDeCalor?.timeA?.tercoDefensivo,
+    metrics?.mapaDeCalor?.timeA?.tercoMedio,
+    metrics?.mapaDeCalor?.timeA?.tercoOfensivo
+  );
+
+  const [bDef, bMid, bAtt] = normalizeTriple100(
+    metrics?.mapaDeCalor?.timeB?.tercoDefensivo,
+    metrics?.mapaDeCalor?.timeB?.tercoMedio,
+    metrics?.mapaDeCalor?.timeB?.tercoOfensivo
+  );
+
+  analysis.estatisticas = {
+    ...(analysis.estatisticas || {}),
+    posseDeBola: {
+      timeA: `${posA}%`,
+      timeB: `${posB}%`,
+    },
+    finalizacoes: {
+      timeA: String(shotsA),
+      timeB: String(shotsB),
+    },
+    finalizacoesNoAlvo: {
+      timeA: String(targetA),
+      timeB: String(targetB),
+    },
+    mapaDeCalor: {
+      timeA: {
+        tercoDefensivo: `${aDef}%`,
+        tercoMedio: `${aMid}%`,
+        tercoOfensivo: `${aAtt}%`,
+      },
+      timeB: {
+        tercoDefensivo: `${bDef}%`,
+        tercoMedio: `${bMid}%`,
+        tercoOfensivo: `${bAtt}%`,
+      },
+    },
+  };
+
+  analysis.indicadoresAvancados = {
+    ...(analysis.indicadoresAvancados || {}),
+    grandesChances: {
+      timeA: String(bigA),
+      timeB: String(bigB),
+    },
+    xG: {
+      timeA: xgA.toFixed(2),
+      timeB: xgB.toFixed(2),
+    },
+  };
+
+  const defensiveA = metrics?.faseDefensiva?.timeA || {};
+  const defensiveB = metrics?.faseDefensiva?.timeB || {};
+  const offensiveA = metrics?.faseOfensiva?.timeA || {};
+  const offensiveB = metrics?.faseOfensiva?.timeB || {};
+
+  analysis.faseDefensiva = {
+    timeA: {
+      posicionamento:
+        cleanTacticalSupplementText(defensiveA.posicionamento) ||
+        analysis.faseDefensiva?.timeA?.posicionamento,
+      compactacao_pressao:
+        cleanTacticalSupplementText(defensiveA.compactacao_pressao) ||
+        analysis.faseDefensiva?.timeA?.compactacao_pressao,
+      transicao:
+        cleanTacticalSupplementText(defensiveA.transicao) ||
+        analysis.faseDefensiva?.timeA?.transicao,
+    },
+    timeB: {
+      posicionamento:
+        cleanTacticalSupplementText(defensiveB.posicionamento) ||
+        analysis.faseDefensiva?.timeB?.posicionamento,
+      compactacao_pressao:
+        cleanTacticalSupplementText(defensiveB.compactacao_pressao) ||
+        analysis.faseDefensiva?.timeB?.compactacao_pressao,
+      transicao:
+        cleanTacticalSupplementText(defensiveB.transicao) ||
+        analysis.faseDefensiva?.timeB?.transicao,
+    },
+  };
+
+  analysis.faseOfensiva = {
+    timeA: {
+      saidaDeBola:
+        cleanTacticalSupplementText(offensiveA.saidaDeBola) ||
+        analysis.faseOfensiva?.timeA?.saidaDeBola,
+      criacao:
+        cleanTacticalSupplementText(offensiveA.criacao) ||
+        analysis.faseOfensiva?.timeA?.criacao,
+      finalizacao_movimentacao:
+        cleanTacticalSupplementText(offensiveA.finalizacao_movimentacao) ||
+        analysis.faseOfensiva?.timeA?.finalizacao_movimentacao,
+    },
+    timeB: {
+      saidaDeBola:
+        cleanTacticalSupplementText(offensiveB.saidaDeBola) ||
+        analysis.faseOfensiva?.timeB?.saidaDeBola,
+      criacao:
+        cleanTacticalSupplementText(offensiveB.criacao) ||
+        analysis.faseOfensiva?.timeB?.criacao,
+      finalizacao_movimentacao:
+        cleanTacticalSupplementText(offensiveB.finalizacao_movimentacao) ||
+        analysis.faseOfensiva?.timeB?.finalizacao_movimentacao,
+    },
+  };
+
+  analysis.sectionValidation = {
+    ...(analysis.sectionValidation || {}),
+    possession: 'partial',
+    heatmap: 'partial',
+    tacticalShape: 'partial',
+    statistics: 'partial',
+  };
+
+  analysis.verificacaoAuditoria = {
+    ...(analysis.verificacaoAuditoria || {}),
+    analiseTaticaOrigem: 'video_trecho_focado',
+    analiseTaticaTrecho: `${startSec}s - ${endSec}s`,
+    analiseTaticaModelo: modelUsed,
+  };
+
+  analysis.verificacaoAuditoria = {
+    ...(analysis.verificacaoAuditoria || {}),
+    metricasOrigem: 'estimativa_visual_trecho',
+    metricasTrecho: `${startSec}s - ${endSec}s`,
+    metricasModelo: modelUsed,
+    metricasConfianca: String(
+      Math.round(clampNumber(metrics?.confianca, 0, 100))
+    ),
+    metricasObservacoes:
+      String(metrics?.observacoes || '').trim() ||
+      'Métricas estimadas visualmente a partir do trecho analisado.',
+  };
+
+  return analysis;
+};
 
 export const getGeminiApiKey = (): string => {
   const key = String(process.env.GEMINI_API_KEY || '').trim();
@@ -174,6 +921,11 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.get('/healthz', (_req, res) => {
   res.status(200).json({ status: 'ok', service: 'protatica' });
 });
+
+console.log(
+  `[GEMINI] configured=${Boolean(getGeminiApiKey())} model=${GEMINI_MODEL} failover=${getGeminiFailoverPlan(GEMINI_MODEL).join('>')} secondarySearch=${GEMINI_ENABLE_SECONDARY_SEARCH}`
+);
+console.log(`[GEMINI_FAILOVER_PLAN] ${getGeminiFailoverPlan(GEMINI_MODEL).join(' > ')}`);
 
 const getPublicAppUrl = (): string => {
   const candidate = String(process.env.APP_PUBLIC_URL || process.env.APP_URL || '').trim();
@@ -647,6 +1399,16 @@ const RESPONSE_SCHEMA = {
   properties: {
     timeA: { type: Type.STRING },
     timeB: { type: Type.STRING },
+    identidadeVideo: {
+      type: Type.OBJECT,
+      properties: {
+        timeAObservado: { type: Type.STRING },
+        timeBObservado: { type: Type.STRING },
+        confirmado: { type: Type.BOOLEAN },
+        evidencia: { type: Type.STRING }
+      },
+      required: ['timeAObservado', 'timeBObservado', 'confirmado', 'evidencia']
+    },
     placar: { type: Type.STRING },
     placarAuditoria: {
       type: Type.OBJECT,
@@ -901,6 +1663,7 @@ const RESPONSE_SCHEMA = {
   required: [
     'timeA',
     'timeB',
+    'identidadeVideo',
     'placar',
     'placarAuditoria',
     'resumoPartida',
@@ -2388,6 +3151,90 @@ app.get('/api/analyses', requireAuth, (req, res) => {
   res.json({ analyses });
 });
 
+app.post(
+  '/api/analyses/:id/recalculate-metrics',
+  requireAuth,
+  requireActiveSubscription,
+  requirePlanAtLeast('intelligence'),
+  async (req, res) => {
+    const user = (req as any).user;
+    const ownerScope = getAnalysisOwnerScope(user);
+    const id = String(req.params.id || '').trim();
+
+    if (!id) return res.status(400).json({ error: 'ID da análise é obrigatório.' });
+
+    try {
+      const analysis = getAnalysisById(id, ownerScope);
+      if (!analysis) return res.status(404).json({ error: 'Análise não encontrada.' });
+
+      const videoUrl = String(analysis.videoUrl || '').trim();
+      if (!/^https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(videoUrl)) {
+        return res.status(400).json({
+          error: 'O recálculo automático de métricas requer uma URL pública do YouTube.',
+        });
+      }
+
+      const apiKey = getGeminiApiKey();
+      if (!apiKey) {
+        return res.status(500).json({ error: 'Gemini não configurada no servidor.' });
+      }
+
+      const { startSec, endSec } = parseAnalysisSegmentRange(analysis);
+
+      console.log(
+        `[SEGMENT_METRICS] analysisId=${id} videoId=${analysis.videoId || 'n/a'} range=${startSec}-${endSec}`
+      );
+
+      const { data, modelUsed } = await extractSegmentMetricsFromVideo({
+        apiKey,
+        videoUrl,
+        timeA: analysis.timeA || 'Time A',
+        timeB: analysis.timeB || 'Time B',
+        startSec,
+        endSec,
+      });
+
+      const updated = applySegmentMetricsToAnalysis(
+        analysis,
+        data,
+        startSec,
+        endSec,
+        modelUsed
+      );
+
+      const saved = updateAnalysisPayload(id, updated);
+      if (!saved) {
+        return res.status(500).json({ error: 'Falha ao atualizar a análise no banco.' });
+      }
+
+      console.log(
+        `[SEGMENT_METRICS] analysisId=${id} success=true model=${modelUsed} confidence=${updated.verificacaoAuditoria?.metricasConfianca}`
+      );
+
+      const refreshedAnalysis = getAnalysisById(id, ownerScope) || updated;
+
+      return res.json({
+        ok: true,
+        analysis: enrichAnalysisFromDb(refreshedAnalysis),
+        metrics: {
+          origin: 'estimativa_visual_trecho',
+          startSec,
+          endSec,
+          modelUsed,
+          confidence: updated.verificacaoAuditoria?.metricasConfianca,
+        },
+      });
+    } catch (err: any) {
+      console.error('[SEGMENT_METRICS] Falha:', err);
+
+      return res.status(502).json({
+        error:
+          'Não foi possível recalcular as métricas do vídeo agora. Tente novamente em alguns minutos.',
+      });
+    }
+  }
+);
+
 app.delete('/api/analyses', requireAuth, (req, res) => {
   const user = (req as any).user;
   const id = req.query.id as string;
@@ -2454,6 +3301,123 @@ app.post('/api/verify-video', requireAuth, async (req, res) => {
     res.status(400).json({ error: err.message || 'Vídeo não pôde ser identificado.' });
   }
 });
+
+// --- GEMINI ADMIN HEALTH CHECK ---
+app.get('/api/admin/gemini/status', requireAdmin, (_req, res) => {
+  res.json({
+    configured: Boolean(getGeminiApiKey()),
+    model: GEMINI_MODEL,
+  });
+});
+
+app.post('/api/admin/gemini/test', requireAdmin, async (req, res) => {
+  const user = (req as any).user || getAuthUser(req);
+  if (!enforceRateLimit(req, res, `gemini-test:${user?.id || 'admin'}`, 5, 5 * 60)) return;
+
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    return res.status(500).json({
+      ok: false,
+      configured: false,
+      model: GEMINI_MODEL,
+      error: 'GEMINI_API_KEY não configurada no servidor.',
+    });
+  }
+
+  const startedAt = Date.now();
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: 'Responda apenas com OK.',
+      config: {
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+      },
+    });
+
+    const responseText = String((response as any)?.text || '').trim();
+    const ok = responseText.length > 0;
+    const finishReason = String((response as any)?.candidates?.[0]?.finishReason || '');
+    const latencyMs = Date.now() - startedAt;
+
+    console.log(`[GEMINI_TEST] model=${GEMINI_MODEL} ok=${ok} latencyMs=${latencyMs} finishReason=${finishReason || 'n/a'}`);
+
+    return res.status(ok ? 200 : 502).json({
+      ok,
+      configured: true,
+      model: GEMINI_MODEL,
+      latencyMs,
+      message: ok ? 'Gemini conectada e respondendo.' : 'A Gemini respondeu, mas o teste de consistência falhou.',
+    });
+  } catch (err) {
+    const latencyMs = Date.now() - startedAt;
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[GEMINI_TEST] model=${GEMINI_MODEL} ok=false latencyMs=${latencyMs} error=${message.slice(0, 300)}`);
+    return res.status(502).json({
+      ok: false,
+      configured: true,
+      model: GEMINI_MODEL,
+      latencyMs,
+      error: 'Falha ao conectar com a API Gemini. Verifique chave, modelo, cota e permissões.',
+    });
+  }
+});
+
+
+const normalizeIdentityTeamName = (value: any): string =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\b(futebol|football|clube|club|esporte|esportivo|esportiva|fc|f c|ec|e c|ac|a c|feminino|feminina|women|womens)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const isGenericIdentityTeam = (value: any): boolean => {
+  const n = normalizeIdentityTeamName(value);
+  return !n || ['time a', 'time b', 'mandante', 'visitante', 'nao confirmado', 'nao identificado'].includes(n);
+};
+
+const identityTeamCompatible = (a: any, b: any): boolean => {
+  const x = normalizeIdentityTeamName(a);
+  const y = normalizeIdentityTeamName(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+
+  const minLen = Math.min(x.length, y.length);
+  if (minLen >= 5 && (x.includes(y) || y.includes(x))) return true;
+
+  const xa = new Set(x.split(' ').filter((t) => t.length >= 3));
+  const ya = new Set(y.split(' ').filter((t) => t.length >= 3));
+  if (!xa.size || !ya.size) return false;
+
+  let common = 0;
+  for (const token of xa) if (ya.has(token)) common++;
+  const ratio = common / Math.min(xa.size, ya.size);
+  return ratio >= 0.75;
+};
+
+const identityPairCompatible = (
+  expectedA: any,
+  expectedB: any,
+  observedA: any,
+  observedB: any
+): { ok: boolean; swapped: boolean } => {
+  const direct =
+    identityTeamCompatible(expectedA, observedA) &&
+    identityTeamCompatible(expectedB, observedB);
+
+  if (direct) return { ok: true, swapped: false };
+
+  const swapped =
+    identityTeamCompatible(expectedA, observedB) &&
+    identityTeamCompatible(expectedB, observedA);
+
+  return { ok: swapped, swapped };
+};
 
 // --- REAL VIDEO & MULTIMODAL ANALYSIS PIPELINE ---
 app.post('/api/analyze', requireAuth, requireActiveSubscription, upload.single('videoFile'), async (req, res) => {
@@ -2534,7 +3498,10 @@ app.post('/api/analyze', requireAuth, requireActiveSubscription, upload.single('
 
   const ai = new GoogleGenAI({ 
     apiKey,
-    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    httpOptions: {
+      headers: { 'User-Agent': 'aistudio-build' },
+      timeout: 600000,
+    }
   });
 
   try {
@@ -2591,24 +3558,72 @@ DIRETRIZES:
     let searchData: any = {};
     let sources: { title: string; uri: string }[] = [];
 
-    try {
-      const searchResponse = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: searchPrompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: SEARCH_SCHEMA,
-          tools: [{ googleSearch: {} }]
-        }
+    if (GEMINI_ENABLE_SECONDARY_SEARCH) {
+      try {
+        const searchResponse = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: searchPrompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: SEARCH_SCHEMA,
+            tools: [{ googleSearch: {} }],
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
+          }
+        });
+        searchData = JSON.parse(searchResponse.text || '{}');
+        const chunks = searchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        sources = chunks?.map((chunk: any) => ({
+          uri: chunk.web?.uri,
+          title: chunk.web?.title
+        })).filter((s: any) => s.uri) || [];
+      } catch (sErr) {
+        console.warn('[SEARCH] Aviso na pesquisa secundária:', sErr);
+      }
+    } else {
+      console.log('[SEARCH] Pesquisa secundária desativada para preservar quota; usando vídeo e metadados da fonte.');
+    }
+
+    // A URL original do vídeo é sempre uma fonte principal.
+    if (verifiedContext.sourceUrl && !sources.some((s: any) => s.uri === verifiedContext.sourceUrl)) {
+      sources.unshift({
+        uri: verifiedContext.sourceUrl,
+        title: verifiedContext.title || 'Vídeo original do YouTube',
       });
-      searchData = JSON.parse(searchResponse.text || '{}');
-      const chunks = searchResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      sources = chunks?.map((chunk: any) => ({
-        uri: chunk.web?.uri,
-        title: chunk.web?.title
-      })).filter((s: any) => s.uri) || [];
-    } catch (sErr) {
-      console.warn('[SEARCH] Aviso na pesquisa secundária:', sErr);
+    }
+
+    // Fallback de metadados objetivos do próprio título do vídeo.
+    // Ex.: "TIME A x TIME B - 12/09 - 15H - CAMPEONATO 2026".
+    const sourceTitle = String(verifiedContext.title || '');
+    const titleYearMatch = sourceTitle.match(/\b(20\d{2})\b/);
+    const titleDateMatch = sourceTitle.match(/\b(\d{1,2})[\/\.](\d{1,2})(?:[\/\.](\d{2,4}))?\b/);
+    const titleTimeMatch = sourceTitle.match(/\b(\d{1,2})\s*[hH](?:(\d{2}))?\b/);
+
+    if (!searchData.temporada && titleYearMatch) {
+      searchData.temporada = titleYearMatch[1];
+    }
+
+    if (!searchData.data && titleDateMatch) {
+      const dd = titleDateMatch[1].padStart(2, '0');
+      const mm = titleDateMatch[2].padStart(2, '0');
+      let yyyy = titleDateMatch[3] || titleYearMatch?.[1] || '';
+      if (yyyy && yyyy.length === 2) yyyy = `20${yyyy}`;
+
+      const hh = titleTimeMatch?.[1]?.padStart(2, '0') || '';
+      const min = titleTimeMatch?.[2]?.padStart(2, '0') || '00';
+      searchData.data = `${dd}/${mm}${yyyy ? '/' + yyyy : ''}${hh ? ' ' + hh + ':' + min : ''}`;
+    }
+
+    if (!searchData.competicao) {
+      const titleSegments = sourceTitle
+        .split(/\s[-–—]\s/)
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      const competitionSegment = titleSegments.find((segment: string) =>
+        /(campeonato|copa|liga|libertadores|sul[- ]americana|champions|europa|brasileir|capixab[aã]o|paulist|carioca|mineiro|ga[uú]cho)/i.test(segment)
+      );
+      if (competitionSegment) searchData.competicao = competitionSegment;
     }
 
     // --- ETAPA 3: VALIDAÇÃO DE CONTEXTO E CÁLCULO DE STATUS ---
@@ -2628,10 +3643,23 @@ DIRETRIZES:
     const normalizedTeamB = normalizeTeamName(timeB);
     const isLineupConfirmed = Array.isArray(searchData?.escalaA) && searchData.escalaA.length >= 7 && Array.isArray(searchData?.escalaB) && searchData.escalaB.length >= 7;
 
-    // Separação estrita de evidências
-    const hasVisualEvidence = Boolean(evidence.hasRealVideoFrames && evidence.frames.length > 0);
+    // Separação estrita de evidências.
+    // Para YouTube público, o Gemini recebe o vídeo diretamente via fileData.
+    const useNativeYouTubeVideo = Boolean(
+      !localVideoPath &&
+      verifiedContext.sourceUrl &&
+      /^https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(verifiedContext.sourceUrl)
+    );
+    const hasVisualEvidence = Boolean(
+      useNativeYouTubeVideo ||
+      (evidence.hasRealVideoFrames && evidence.frames.length > 0)
+    );
     const hasTranscriptEvidence = Boolean(evidence.hasTranscript && evidence.transcriptSegments.length > 0);
     const isIdentityConfirmed = Boolean(verifiedContext.videoId && (verifiedContext.title || verifiedContext.sourceUrl));
+
+    console.log(
+      `[GEMINI_VIDEO] nativeYouTube=${useNativeYouTubeVideo} start=${startSec}s end=${endSec}s`
+    );
 
     // Métricas de cobertura visual
     const frameCount = evidence.frames.length;
@@ -2646,12 +3674,18 @@ DIRETRIZES:
       firstTimestamp,
       lastTimestamp,
       analyzedDuration,
-      coverageRatio: Math.round(coverageRatio * 100) / 100
+      coverageRatio: useNativeYouTubeVideo ? 1 : Math.round(coverageRatio * 100) / 100,
+      nativeYouTubeVideo: useNativeYouTubeVideo
     };
 
-    // Limiares para validação das seções visuais
-    const enoughForTacticalShape = hasVisualEvidence && frameCount >= 6 && visualCoverage.coverageRatio >= 0.20;
-    const enoughForVisualScouting = hasVisualEvidence && frameCount >= 8 && visualCoverage.coverageRatio >= 0.20;
+    // Quando o vídeo é enviado nativamente ao Gemini, a evidência visual não
+    // depende da extração local de storyboards.
+    const enoughForTacticalShape =
+      useNativeYouTubeVideo ||
+      (hasVisualEvidence && frameCount >= 6 && visualCoverage.coverageRatio >= 0.20);
+    const enoughForVisualScouting =
+      useNativeYouTubeVideo ||
+      (hasVisualEvidence && frameCount >= 8 && visualCoverage.coverageRatio >= 0.20);
 
     let isMatchContextCoherent = false;
     let isConflict = false;
@@ -2682,13 +3716,20 @@ DIRETRIZES:
       validationStatus = 'unverified';
     }
 
+    // URL/título e capacidade nativa de abrir o YouTube não provam, sozinhos,
+    // que o conteúdo visual corresponde à partida esperada.
+    if (useNativeYouTubeVideo && !evidence.hasRealVideoFrames && !hasTranscriptEvidence && validationStatus === 'verified') {
+      validationStatus = 'partial';
+      console.log('[IDENTITY_GATE_PRE_AI] status downgraded verified -> partial até confirmação visual da IA');
+    }
+
     // Validação granular por seção
     const sectionValidation = {
       matchIdentity: (isConflict ? 'unverified' : (isIdentityConfirmed && (hasVisualEvidence || hasTranscriptEvidence) && isMatchContextCoherent ? 'verified' : (isIdentityConfirmed || isMatchContextCoherent || searchData?.timeA ? 'partial' : 'unverified'))) as 'verified' | 'partial' | 'unverified',
       score: (isMatchContextCoherent && searchData?.placarReal && searchData.placarReal !== 'Não identificado' ? 'verified' : (hasTranscriptEvidence || hasVisualEvidence ? 'partial' : 'unverified')) as 'verified' | 'partial' | 'unverified',
       tacticalShape: (enoughForTacticalShape ? 'verified' : (isLineupConfirmed ? 'partial' : 'unverified')) as 'verified' | 'partial' | 'unverified',
       // Storyboard frames alone cannot prove a full-match heatmap; without tracking data this is at most partial.
-      heatmap: (hasVisualEvidence && frameCount >= 6 ? 'partial' : 'unverified') as 'verified' | 'partial' | 'unverified',
+      heatmap: (useNativeYouTubeVideo || (hasVisualEvidence && frameCount >= 6) ? 'partial' : 'unverified') as 'verified' | 'partial' | 'unverified',
       scouting: (enoughForVisualScouting ? 'verified' : (hasTranscriptEvidence || isLineupConfirmed ? 'partial' : 'unverified')) as 'verified' | 'partial' | 'unverified',
       statistics: ((hasVisualEvidence || hasTranscriptEvidence) ? 'partial' : 'unverified') as 'verified' | 'partial' | 'unverified',
     };
@@ -2704,7 +3745,24 @@ DIRETRIZES:
     // --- ETAPA 4: MONTAGEM DO PROMPT MULTIMODAL COM EVIDÊNCIAS ---
     const multimodalParts: any[] = [];
 
-    // Adiciona frames visuais reais ou referência de thumbnail com aviso obrigatório
+    // Caminho preferencial no V6.10: o Gemini 3.8 processa a URL pública
+    // do YouTube diretamente, com recorte do trecho escolhido pelo usuário.
+    if (useNativeYouTubeVideo) {
+      const nativeFps = analysisMode === 'complete' ? 0.1 : 0.2;
+      multimodalParts.push({
+        fileData: {
+          fileUri: verifiedContext.sourceUrl,
+          mimeType: 'video/*',
+        },
+        videoMetadata: {
+          startOffset: `${Math.max(0, Math.floor(startSec))}s`,
+          endOffset: `${Math.max(Math.floor(startSec) + 1, Math.floor(endSec))}s`,
+          fps: nativeFps,
+        },
+      });
+    }
+
+    // Frames locais/storyboard permanecem como evidência complementar/fallback.
     if (evidence.frames.length > 0) {
       for (const frame of evidence.frames) {
         multimodalParts.push({
@@ -2714,7 +3772,7 @@ DIRETRIZES:
           }
         });
       }
-    } else if (evidence.thumbnailFrame) {
+    } else if (!useNativeYouTubeVideo && evidence.thumbnailFrame) {
       multimodalParts.push({
         text: 'ATENÇÃO CRÍTICA SOBRE A IMAGEM FORNECIDA:\nA imagem abaixo é apenas a THUMBNAIL do vídeo e NÃO representa um frame da partida.\nNÃO utilize esta imagem para inferir formação tática, posicionamento, jogadores, mapa de calor, eventos ou scouting.'
       });
@@ -2736,9 +3794,9 @@ DADOS DO VÍDEO ANALISADO:
 - INTERVALO DO CLIPE: ${startSec}s a ${endSec}s (${formatSecondsToTimestamp(startSec)} a ${formatSecondsToTimestamp(endSec)})
 - MODO: ${analysisMode.toUpperCase()}
 
-MATCH CONTEXT IDENTIFICADO:
-- Time A (Mandante): ${timeA}
-- Time B (Visitante): ${timeB}
+IDENTIDADE ESPERADA PELO TÍTULO/METADADOS — AINDA NÃO CONFIRMADA VISUALMENTE:
+- Time A esperado: ${timeA}
+- Time B esperado: ${timeB}
 - Competição: ${searchData?.competicao || 'Não identificada'}
 - Temporada: ${searchData?.temporada || 'Não identificada'}
 - Data do Jogo: ${searchData?.data || 'Não identificada'}
@@ -2749,29 +3807,61 @@ EVIDÊNCIA PRIMÁRIA AUDIOVISUAL:
 ${evidence.hasTranscript ? `\nTRANSCRIÇÃO DE ÁUDIO COM MINUTAGEM DO TRECHO (${startSec}s a ${endSec}s, modo ${analysisMode}):\n${evidence.transcriptFullText.slice(0, 4500)}` : '\nTranscrição textual: Não disponível diretamente no trecho.'}
 
 DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
+0. PORTÃO DE IDENTIDADE OBRIGATÓRIO:
+   - Antes de qualquer análise tática, identifique VISUALMENTE quais equipes aparecem no vídeo atual.
+   - Preencha identidadeVideo.timeAObservado e identidadeVideo.timeBObservado com o que você realmente reconhece no conteúdo visual.
+   - NÃO copie automaticamente os nomes da "identidade esperada" acima.
+   - Se não houver evidência visual suficiente para confirmar os dois times, use "NÃO CONFIRMADO" nos campos observados e identidadeVideo.confirmado=false.
+   - Se o vídeo mostrar equipes diferentes das esperadas, informe os nomes realmente observados e identidadeVideo.confirmado=false.
+   - identidadeVideo.evidencia deve dizer brevemente qual evidência visual sustentou a identificação (placar na tela, escudos, uniformes, GC da transmissão etc.).
+   - Não produza conteúdo de outro confronto para preencher lacunas.
 1. FIDELIDADE ABSOLUTA AO VÍDEO ATUAL: Analise EXCLUSIVAMENTE as ações ocorridas entre ${formatSecondsToTimestamp(startSec)} e ${formatSecondsToTimestamp(endSec)} deste vídeo. NÃO utilize memórias de outros confrontos, temporadas passadas ou escalações genéricas.
 2. GERAL: Forneça um resumo tático profundo da partida/lance contido no clipe, momentos-chave detalhados com timestamps reais entre ${formatSecondsToTimestamp(startSec)} e ${formatSecondsToTimestamp(endSec)}, contexto e conclusões objetivas.
 3. FORMAÇÕES: Detalhe o esquema tático (ex: 4-3-3, 4-2-3-1, 3-5-2), titulares e destaques funcionais para Time A e Time B (utilize escalações oficiais confirmadas pela pesquisa ou observadas no jogo).
 4. FASES DO JOGO: Detalhe a fase defensiva (posicionamento do bloco, compactação, pressão pós-perda, transição) e ofensiva (saída de bola, criação, finalização e movimentações) de cada time no trecho.
-5. ESTATÍSTICAS & POSSE DE BOLA: NÃO INVENTE NÚMEROS. Só preencha posse, finalizações, finalizações no alvo, passes certos, faltas, desarmes, escanteios e impedimentos quando o valor estiver explicitamente observado no vídeo/transcrição ou confirmado por fonte confiável da partida. Quando não houver evidência suficiente, use 'Não disponível'.
-6. MAPA DE CALOR & TERÇOS: Trate a distribuição espacial como observação qualitativa. Só informe percentuais se puderem ser derivados de evidência visual suficiente; caso contrário, use 'Não disponível'.
-7. INDICADORES AVANÇADOS: NÃO estime xG nem outras métricas avançadas por plausibilidade. Informe xG, grandes chances e passes no terço final apenas quando houver fonte/medição explícita. Sem evidência, use 'Não disponível'.
+5. MÉTRICAS DO TRECHO DE VÍDEO:
+   Quando o vídeo estiver disponível nativamente para análise, gere métricas visuais estimadas SOMENTE para ESTE TRECHO:
+   - posseDeBola: estime o tempo de controle visível de cada time; os dois percentuais devem somar 100;
+   - finalizacoes: conte chutes/tentativas observados, sem duplicar replays;
+   - finalizacoesNoAlvo: conte chutes no alvo observados; nunca maior que finalizacoes;
+   - escanteios, faltas, impedimentos: conte somente eventos claramente observados.
+   Se não houver evidência visual suficiente, omita a métrica em vez de inventar.
+   IMPORTANTE: esses números são do TRECHO analisado, não da partida completa.
+6. MAPA DE CALOR & TERÇOS:
+   Quando houver vídeo nativo, faça uma estimativa territorial do TRECHO para cada time, baseada na localização da bola durante suas posses controladas.
+   Para cada equipe, tercoDefensivo + tercoMedio + tercoOfensivo deve somar 100%.
+   Use apenas percentuais curtos como "28%", "44%", "28%".
+   Se não houver evidência visual suficiente, omita o mapa.
+   Nunca coloque frases qualitativas nos campos dos terços.
+7. INDICADORES AVANÇADOS:
+   Quando houver vídeo nativo:
+   - grandesChances: conte oportunidades claramente perigosas observadas no TRECHO, sem duplicar replay;
+   - xG: forneça um xG IA APROXIMADO DO TRECHO, baseado apenas nas finalizações visíveis (distância, ângulo, pressão e situação do goleiro).
+   Este xG NÃO é estatística oficial nem modelo calibrado de provedor externo.
+   Sem evidência suficiente, omita o campo.
+   Nunca use "Não disponível", "N/D" ou texto de placeholder como valor numérico.
 8. SCOUTING INDIVIDUAL E IDENTIFICAÇÃO PROGRESSIVA: Analise de 3 a 6 jogadores em destaque. Se um jogador for identificado pelo número da camisa (ex: #8) mas seu nome completo não puder ser confirmado, use 'Jogador nº 8 – [Time]' e nivelConfianca 'media'/'baixa'. NUNCA atribua o nome de uma estrela que não participou do lance/jogo.
 9. AUDITORIA DE PLACAR: Informe o placar final confirmado (${searchData?.placarReal || 'Não informado'}), placar visível no vídeo, fonte e confiança.
 10. Toda a resposta DEVE ser um JSON estritamente válido em Português do Brasil de acordo com o esquema RESPONSE_SCHEMA.`;
 
     multimodalParts.push({ text: promptText });
 
-    const aiResponse = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: multimodalParts,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: RESPONSE_SCHEMA,
-        maxOutputTokens: 8192,
-        temperature: 0.1,
-      }
-    });
+    const { response: aiResponse, modelUsed: analysisModelUsed } = await generateGeminiResilient(
+      ai,
+      {
+        model: GEMINI_MODEL,
+        contents: multimodalParts,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: RESPONSE_SCHEMA,
+          maxOutputTokens: 32768,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.MEDIUM,
+          },
+        },
+      },
+      'match-analysis'
+    );
 
     const rawText = aiResponse.text;
     if (!rawText) throw new Error('A IA não retornou conteúdo. Tente novamente.');
@@ -2779,9 +3869,154 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     const parsed = parseJsonResponse(rawText);
     if (!parsed) throw new Error('Falha ao processar o formato da análise. Tente novamente.');
 
-    // --- ETAPA 5: SANITIZAÇÃO, AUDITORIA DE PLACAR E NORMALIZAÇÃO ---
+    // --- ETAPA 5: PORTÃO DE IDENTIDADE + SANITIZAÇÃO ---
+    // NUNCA sobrescreva os nomes reportados pela IA antes desta validação.
+    const aiReportedTimeA = String(parsed.timeA || '').trim();
+    const aiReportedTimeB = String(parsed.timeB || '').trim();
+    const observedIdentityA = String(parsed.identidadeVideo?.timeAObservado || aiReportedTimeA || '').trim();
+    const observedIdentityB = String(parsed.identidadeVideo?.timeBObservado || aiReportedTimeB || '').trim();
+    const visualIdentityConfirmed = parsed.identidadeVideo?.confirmado === true;
+
+    const expectedIdentityIsStrict =
+      !isGenericIdentityTeam(timeA) &&
+      !isGenericIdentityTeam(timeB);
+
+    const identityMatch = identityPairCompatible(
+      timeA,
+      timeB,
+      observedIdentityA,
+      observedIdentityB
+    );
+
+    console.log(
+      `[IDENTITY_GATE] expected="${timeA} x ${timeB}" observed="${observedIdentityA} x ${observedIdentityB}" visualConfirmed=${visualIdentityConfirmed} pairMatch=${identityMatch.ok} swapped=${identityMatch.swapped}`
+    );
+
+    if (expectedIdentityIsStrict && (!visualIdentityConfirmed || !identityMatch.ok)) {
+      const identityError: any = new Error(
+        `A análise foi bloqueada porque a identidade visual do jogo não coincide com o vídeo esperado. Esperado: ${timeA} x ${timeB}. Identificado pela IA: ${observedIdentityA || 'não confirmado'} x ${observedIdentityB || 'não confirmado'}.`
+      );
+      identityError.code = 'MATCH_IDENTITY_CONFLICT';
+      identityError.status = 409;
+      identityError.expectedTeams = [timeA, timeB];
+      identityError.observedTeams = [observedIdentityA, observedIdentityB];
+      throw identityError;
+    }
+
+    // Somente depois do portão de identidade os nomes canônicos do título/metadado
+    // podem ser usados para padronizar a apresentação.
     parsed.timeA = timeA;
     parsed.timeB = timeB;
+
+    if (!parsed.verificacaoAuditoria) parsed.verificacaoAuditoria = {};
+    parsed.verificacaoAuditoria.identityAudit = {
+      expectedTimeA: timeA,
+      expectedTimeB: timeB,
+      observedTimeA: observedIdentityA,
+      observedTimeB: observedIdentityB,
+      visuallyConfirmed: visualIdentityConfirmed,
+      pairMatched: identityMatch.ok,
+      swapped: identityMatch.swapped,
+      evidence: String(parsed.identidadeVideo?.evidencia || '').trim(),
+    };
+
+    if (!parsed.verificacaoAuditoria) parsed.verificacaoAuditoria = {};
+    if (useNativeYouTubeVideo) {
+      parsed.verificacaoAuditoria.metricasOrigem = 'estimativa_visual_trecho';
+      parsed.verificacaoAuditoria.metricasTrecho = `${startSec}s - ${endSec}s`;
+      parsed.verificacaoAuditoria.metricasModelo = GEMINI_MODEL;
+      parsed.verificacaoAuditoria.metricasObservacoes =
+        'Posse, ocupação por terços e xG são estimativas visuais do trecho; contagens representam eventos observados no trecho, não estatísticas oficiais da partida completa.';
+    }
+
+    const tacticalNarrativeOk = (value: any) =>
+      Boolean(cleanTacticalSupplementText(value));
+
+    // Number('') retorna 0. A checagem antiga tratava campo vazio como dado
+    // válido e impedia o complemento automático.
+    const metricValuePresent = (value: any) => {
+      if (value === null || value === undefined) return false;
+      const clean = String(value).replace('%', '').replace(',', '.').trim();
+      return clean !== '' && Number.isFinite(Number(clean));
+    };
+
+    const metricPairComplete = (pair: any) =>
+      metricValuePresent(pair?.timeA) && metricValuePresent(pair?.timeB);
+
+    const possessionComplete = metricPairComplete(parsed?.estatisticas?.posseDeBola);
+
+    const finishingComplete = Boolean(
+      metricPairComplete(parsed?.estatisticas?.finalizacoes) &&
+      metricPairComplete(parsed?.estatisticas?.finalizacoesNoAlvo) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.xG) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.grandesChances)
+    );
+
+    const heatmapComplete = Boolean(
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio &&
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo
+    );
+
+    const defensiveComplete = Boolean(
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeA?.posicionamento) &&
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeA?.compactacao_pressao) &&
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeA?.transicao) &&
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeB?.posicionamento) &&
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeB?.compactacao_pressao) &&
+      tacticalNarrativeOk(parsed?.faseDefensiva?.timeB?.transicao)
+    );
+
+    const offensiveComplete = Boolean(
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeA?.saidaDeBola) &&
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeA?.criacao) &&
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeA?.finalizacao_movimentacao) &&
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeB?.saidaDeBola) &&
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeB?.criacao) &&
+      tacticalNarrativeOk(parsed?.faseOfensiva?.timeB?.finalizacao_movimentacao)
+    );
+
+    // O passe principal pode devolver valores aparentemente válidos que são
+    // removidos depois pela normalização. Para vídeo nativo, o passe focado é
+    // sempre executado antes de salvar e passa a ser a fonte definitiva das
+    // métricas e das fases táticas.
+    const needsTacticalCompletion = useNativeYouTubeVideo;
+
+    if (needsTacticalCompletion) {
+      console.log(
+        `[TACTICAL_COMPLETION] start possession=${possessionComplete} finishing=${finishingComplete} heatmap=${heatmapComplete} defensive=${defensiveComplete} offensive=${offensiveComplete}`
+      );
+
+      try {
+        const completion = await extractSegmentMetricsFromVideo({
+          apiKey,
+          videoUrl: verifiedContext.sourceUrl,
+          timeA,
+          timeB,
+          startSec,
+          endSec,
+        });
+
+        applySegmentMetricsToAnalysis(
+          parsed,
+          completion.data,
+          startSec,
+          endSec,
+          completion.modelUsed
+        );
+
+        console.log(
+          `[TACTICAL_COMPLETION] success model=${completion.modelUsed} range=${startSec}-${endSec}`
+        );
+      } catch (completionErr: any) {
+        console.warn(
+          `[TACTICAL_COMPLETION] warning=${String(completionErr?.message || completionErr).slice(0, 280)}`
+        );
+      }
+    }
 
     if (!parsed.contextoPartida) parsed.contextoPartida = {};
     parsed.contextoPartida.competicao = searchData?.competicao || parsed.contextoPartida.competicao || 'Não identificada';
@@ -2866,13 +4101,30 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
       verificacaoAuditoria: {
         ...parsed.verificacaoAuditoria,
         partidaIdentificada: `${timeA} x ${timeB}`,
-        modeloUsado: GEMINI_MODEL,
+        modeloUsado: analysisModelUsed,
         trechoAnalisado: `${startSec}s - ${endSec}s (${formatSecondsToTimestamp(startSec)} - ${formatSecondsToTimestamp(endSec)})`,
-        estrategiaAnalise: `Análise Audiovisual Multimodal (${evidence.frames.length} frames, ${evidence.transcriptSegments.length} falas) com Verificação Secundária`,
+        estrategiaAnalise: useNativeYouTubeVideo
+          ? `Vídeo público do YouTube analisado nativamente pelo Gemini (${formatSecondsToTimestamp(startSec)}–${formatSecondsToTimestamp(endSec)}), com metadados da fonte`
+          : `Análise Audiovisual Multimodal (${evidence.frames.length} frames, ${evidence.transcriptSegments.length} falas)`,
         nivelConfianca: validationStatus === 'verified' ? 'alta' : validationStatus === 'partial' ? 'media' : 'baixa',
         fontesPrincipais: sources.map((s: any) => s.title || s.uri)
       }
     });
+
+    if (expectedIdentityIsStrict && visualIdentityConfirmed && identityMatch.ok) {
+      normalized.validationStatus = 'verified';
+      normalized.sectionValidation = {
+        ...(normalized.sectionValidation || {}),
+        matchIdentity: 'verified',
+      };
+      if (normalized.verificacaoAuditoria) {
+        normalized.verificacaoAuditoria.nivelConfianca =
+          normalized.verificacaoAuditoria.nivelConfianca === 'baixa'
+            ? 'media'
+            : normalized.verificacaoAuditoria.nivelConfianca;
+      }
+      console.log('[IDENTITY_GATE] accepted');
+    }
 
     // Verificação de integridade estrita
     if (normalized.videoId !== verifiedContext.videoId || normalized.sourceFingerprint !== sourceFingerprint) {
@@ -2901,7 +4153,36 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     res.json({ analysis: normalized });
   } catch (err: any) {
     console.error('Erro técnico na análise:', err);
-    res.status(500).json({ error: err.message || 'Erro ao processar análise.' });
+
+    if (err?.code === 'MATCH_IDENTITY_CONFLICT') {
+      return res.status(409).json({
+        error: err.message,
+        code: 'MATCH_IDENTITY_CONFLICT',
+        retryable: false,
+        expectedTeams: err.expectedTeams || [],
+        observedTeams: err.observedTeams || [],
+      });
+    }
+
+    const geminiCode = getGeminiErrorCode(err);
+    const retryable = err?.code === 'GEMINI_TEMPORARILY_UNAVAILABLE' || isTransientGeminiError(err);
+
+    if (retryable) {
+      const quotaRelated = geminiCode === 429;
+      return res.status(quotaRelated ? 429 : 503).json({
+        error: quotaRelated
+          ? 'O limite temporário de uso da inteligência artificial foi atingido. Aguarde alguns minutos e tente novamente.'
+          : 'A inteligência artificial está com alta demanda no momento. O ProTática tentou novamente automaticamente, inclusive com o modelo de contingência. Aguarde alguns minutos e tente novamente.',
+        code: quotaRelated ? 'AI_RATE_LIMITED' : 'AI_TEMPORARILY_UNAVAILABLE',
+        retryable: true,
+        retryAfterSeconds: Math.max(
+          5,
+          Number(err?.retryAfterSeconds || getGeminiRetryAfterSeconds(err) || 45)
+        ),
+      });
+    }
+
+    res.status(500).json({ error: 'Não foi possível concluir a análise. Verifique o vídeo e tente novamente.' });
   } finally {
     if (localVideoPath && existsSync(localVideoPath)) {
       try { rmSync(localVideoPath, { force: true }); } catch {}
@@ -2970,16 +4251,22 @@ Conclusão: ${matchContext.conclusao || ''}
 
 Responda em formato estruturado (com tópicos claros, timestamps quando aplicável e recomendação prática).`;
 
-    const chatResponse = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [
-        { role: 'user', parts: [{ text: systemPrompt }, { text: userPrompt }] }
-      ],
-      config: {
-        maxOutputTokens: 2048,
-        temperature: 0.2,
-      }
-    });
+    const { response: chatResponse } = await generateGeminiResilient(
+      ai,
+      {
+        model: GEMINI_MODEL,
+        contents: [
+          { role: 'user', parts: [{ text: systemPrompt }, { text: userPrompt }] }
+        ],
+        config: {
+          maxOutputTokens: 8192,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.LOW,
+          },
+        },
+      },
+      'match-ask'
+    );
 
     const answer = chatResponse.text || 'Não foi possível gerar a resposta no momento.';
     res.json({ answer, timestamp: new Date().toISOString() });
@@ -3283,14 +4570,21 @@ DADOS DAS PARTIDAS:
 ${JSON.stringify(contextMatches, null, 2)}
 `;
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.15,
-      }
-    });
+    const { response } = await generateGeminiResilient(
+      ai,
+      {
+        model: GEMINI_MODEL,
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 16384,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.MEDIUM,
+          },
+        },
+      },
+      'opponent-dossier'
+    );
 
     const text = response.text || '{}';
     let dossierData: any = {};

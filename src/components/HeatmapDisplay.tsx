@@ -7,13 +7,29 @@ interface HeatmapDisplayProps {
     timeB: string;
 }
 
+const normalizeHeatPercent = (value?: string): string | undefined => {
+    if (value === null || value === undefined) return undefined;
+    const raw = String(value).trim().replace(',', '.');
+    const match = raw.match(/^(\d{1,3}(?:\.\d{1,2})?)\s*%?$/);
+    if (!match) return undefined;
+
+    const num = Number(match[1]);
+    if (!Number.isFinite(num) || num < 0 || num > 100) return undefined;
+
+    return `${Number.isInteger(num) ? num : Math.round(num * 10) / 10}%`;
+};
+
 const parsePercent = (str?: string) => {
-    if (!str) return 0;
-    return parseFloat(String(str).replace('%', '')) || 0;
+    const normalized = normalizeHeatPercent(str);
+    if (!normalized) return 0;
+    return parseFloat(normalized.replace('%', '')) || 0;
 };
 
 const TeamHeatmap: React.FC<{ teamName: string; teamData?: MapaDeCalor; color: string }> = ({ teamName, teamData, color }) => {
-    const hasData = Boolean(teamData?.tercoDefensivo || teamData?.tercoMedio || teamData?.tercoOfensivo);
+    const safeDef = normalizeHeatPercent(teamData?.tercoDefensivo);
+    const safeMed = normalizeHeatPercent(teamData?.tercoMedio);
+    const safeOf = normalizeHeatPercent(teamData?.tercoOfensivo);
+    const hasData = Boolean(safeDef || safeMed || safeOf);
 
     if (!hasData) {
         return (
@@ -26,13 +42,13 @@ const TeamHeatmap: React.FC<{ teamName: string; teamData?: MapaDeCalor; color: s
         );
     }
 
-    const safeDef = teamData?.tercoDefensivo || '—';
-    const safeMed = teamData?.tercoMedio || '—';
-    const safeOf = teamData?.tercoOfensivo || '—';
+    const displayDef = safeDef || '—';
+    const displayMed = safeMed || '—';
+    const displayOf = safeOf || '—';
 
-    const opDef = Math.max(0.15, Math.min(0.9, (parsePercent(teamData?.tercoDefensivo) || 33) / 100));
-    const opMed = Math.max(0.15, Math.min(0.9, (parsePercent(teamData?.tercoMedio) || 33) / 100));
-    const opOf = Math.max(0.15, Math.min(0.9, (parsePercent(teamData?.tercoOfensivo) || 33) / 100));
+    const opDef = Math.max(0.15, Math.min(0.9, (parsePercent(safeDef) || 33) / 100));
+    const opMed = Math.max(0.15, Math.min(0.9, (parsePercent(safeMed) || 33) / 100));
+    const opOf = Math.max(0.15, Math.min(0.9, (parsePercent(safeOf) || 33) / 100));
 
     return (
         <div>
@@ -42,19 +58,19 @@ const TeamHeatmap: React.FC<{ teamName: string; teamData?: MapaDeCalor; color: s
                     className="flex-1 flex items-center justify-center transition-all" 
                     style={{ backgroundColor: color, opacity: opDef }}
                 >
-                    <span className="font-bold text-white text-sm drop-shadow">{safeDef}</span>
+                    <span className="font-bold text-white text-sm drop-shadow">{displayDef}</span>
                 </div>
                 <div 
                     className="flex-1 flex items-center justify-center transition-all border-x border-black/30" 
                     style={{ backgroundColor: color, opacity: opMed }}
                 >
-                    <span className="font-bold text-white text-sm drop-shadow">{safeMed}</span>
+                    <span className="font-bold text-white text-sm drop-shadow">{displayMed}</span>
                 </div>
                 <div 
                     className="flex-1 flex items-center justify-center transition-all" 
                     style={{ backgroundColor: color, opacity: opOf }}
                 >
-                    <span className="font-bold text-white text-sm drop-shadow">{safeOf}</span>
+                    <span className="font-bold text-white text-sm drop-shadow">{displayOf}</span>
                 </div>
             </div>
             <div className="flex w-full text-xs text-center text-yellow-300/70 mt-1.5 font-medium">

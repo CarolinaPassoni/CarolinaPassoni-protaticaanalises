@@ -40,9 +40,9 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
   const [filterFeatured, setFilterFeatured] = useState<boolean>(false);
   const [resolvingMatchId, setResolvingMatchId] = useState<string | null>(null);
 
-  const fetchData = async () => {
+  const fetchData = async (silent = false) => {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const [matchesRes, compRes] = await Promise.all([
         fetch('/api/matches'),
         fetch('/api/competitions'),
@@ -59,12 +59,14 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
     } catch (err) {
       console.error('Error fetching matches:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => {
     fetchData();
+    const refreshTimer = window.setInterval(() => fetchData(true), 60 * 1000);
+    return () => window.clearInterval(refreshTimer);
   }, []);
 
   const handleSetVideoUrl = async (match: Match) => {
@@ -251,7 +253,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
 
                     {/* Middle Score / VS */}
                     <div className="text-center shrink-0">
-                      {match.homeScore !== null && match.awayScore !== null ? (
+                      {match.status !== 'scheduled' && match.homeScore !== null && match.awayScore !== null ? (
                         <div className="text-lg font-black text-white font-mono bg-zinc-900/80 px-3 py-1 rounded-lg border border-zinc-800">
                           {match.homeScore} x {match.awayScore}
                         </div>
@@ -314,16 +316,17 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                     <div className="min-w-0">
                       <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Vídeo-fonte</p>
                       <p className={`text-[11px] truncate ${match.videoUrl ? 'text-emerald-400' : 'text-amber-400'}`}>
-                        {match.videoUrl ? 'Fonte localizada' : 'Fonte automática ao analisar'}
+                        {match.videoUrl ? 'Fonte localizada' : match.status === 'scheduled' ? 'Busca automática após o término' : match.status === 'live' ? 'Aguardando término da partida' : match.status === 'finished_waiting_video' ? 'Buscando vídeo validado' : 'Fonte automática ao analisar'}
                       </p>
                     </div>
                     <button
                       type="button"
                       onClick={() => handleSetVideoUrl(match)}
-                      className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] font-bold text-amber-300 hover:bg-amber-500/20"
+                      disabled={match.status === 'scheduled' || match.status === 'live'}
+                      className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[10px] font-bold text-amber-300 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-amber-500/10"
                     >
                       <ExternalLink className="w-3 h-3" />
-                      {match.videoUrl ? 'Ajustar fonte' : 'Definir manualmente'}
+                      {match.videoUrl ? 'Ajustar fonte' : (match.status === 'scheduled' || match.status === 'live') ? 'Após o término' : 'Definir manualmente'}
                     </button>
                   </div>
                 )}
@@ -349,7 +352,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
                   ) : (
                     <div className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-zinc-900/70 border border-zinc-800 text-zinc-400 font-bold text-xs rounded-xl">
                       <Clock className="w-4 h-4" />
-                      {match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO DA PARTIDA'}
+                      {match.status === 'scheduled' ? 'PARTIDA AGENDADA' : match.status === 'live' ? 'PARTIDA EM ANDAMENTO' : 'AGUARDANDO VÍDEO DA PARTIDA'}
                     </div>
                   )}
                 </div>

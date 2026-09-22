@@ -189,29 +189,26 @@ export async function analyzeFootballMatch(
   request: AnalysisRequest,
   onProgress?: (step: string, pct: number | null) => void
 ): Promise<Analysis> {
-  let progressInterval: any = null;
+  const progressTimers: any[] = [];
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
   if (onProgress) {
-    onProgress('Iniciando análise técnica multimodal...', 5);
-    let pct = 5;
-    progressInterval = setInterval(() => {
-      if (pct < 30) {
-        pct += 5;
-        onProgress('Extraindo frames visuais e transcrição temporal do vídeo...', pct);
-      } else if (pct < 60) {
-        pct += 3;
-        onProgress('Auditorando lances,HUD e evidências em campo...', pct);
-      } else if (pct < 88) {
-        pct += 2;
-        onProgress('Executando raciocínio tático com Gemini Multimodal...', pct);
-      } else {
-        onProgress('Consolidando e salvando relatório auditado...', 95);
-      }
-    }, 2000);
+    onProgress('Enviando o trecho do vídeo para a inteligência artificial...', null);
+
+    progressTimers.push(setTimeout(() => {
+      onProgress('Processando o conteúdo visual do vídeo...', null);
+    }, 15000));
+
+    progressTimers.push(setTimeout(() => {
+      onProgress('Analisando organização tática, eventos e transições...', null);
+    }, 60000));
+
+    progressTimers.push(setTimeout(() => {
+      onProgress('A análise continua em processamento. Não feche esta tela...', null);
+    }, 180000));
   }
 
-  try {
-    let response: Response;
-
+  const sendRequest = async (): Promise<Response> => {
     if (request.type === 'file') {
       const formData = new FormData();
       formData.append('videoFile', request.file);
@@ -219,43 +216,87 @@ export async function analyzeFootballMatch(
       formData.append('clipStartSeconds', String(request.clipStartSeconds || 0));
       formData.append('clipEndSeconds', String(request.clipEndSeconds || 900));
 
-      response = await fetch('/api/analyze', {
+      return fetch('/api/analyze', {
         method: 'POST',
         headers: getAuthHeaders(),
         body: formData,
       });
-    } else {
-      const body = {
-        type: 'url',
-        url: request.url,
-        mode: request.mode || 'quick',
-        clipStartSeconds: request.clipStartSeconds || 0,
-        clipEndSeconds: request.clipEndSeconds || 900,
-      };
-
-      response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify(body),
-      });
     }
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Erro ao processar análise.');
+    const body = {
+      type: 'url',
+      url: request.url,
+      mode: request.mode || 'quick',
+      clipStartSeconds: request.clipStartSeconds || 0,
+      clipEndSeconds: request.clipEndSeconds || 900,
+    };
+
+    return fetch('/api/analyze', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify(body),
+    });
+  };
+
+  try {
+    const maxCycles = 3;
+    let lastMessage = 'A inteligência artificial está temporariamente indisponível.';
+
+    for (let cycle = 1; cycle <= maxCycles; cycle++) {
+      if (onProgress && cycle > 1) {
+        onProgress(
+          `Nova tentativa automática ${cycle}/${maxCycles} iniciada...`,
+          null
+        );
+      }
+
+      const response = await sendRequest();
+
+      if (response.ok) {
+        const data = await response.json();
+        if (onProgress) onProgress('Concluído!', 100);
+        return data.analysis;
+      }
+
+      const error = await response.json().catch(() => ({}));
+      lastMessage = error?.error || 'Erro ao processar análise.';
+
+      const retryable =
+        Boolean(error?.retryable) &&
+        (response.status === 429 || response.status === 503);
+
+      if (!retryable || cycle >= maxCycles) {
+        throw new Error(lastMessage);
+      }
+
+      const fallbackDelays = [8, 20, 45];
+      const requestedDelay = Number(error?.retryAfterSeconds || 0);
+      const waitSeconds = Math.min(
+        60,
+        Math.max(
+          fallbackDelays[Math.min(cycle - 1, fallbackDelays.length - 1)],
+          Number.isFinite(requestedDelay) ? requestedDelay : 0
+        )
+      );
+
+      for (let remaining = waitSeconds; remaining > 0; remaining--) {
+        if (onProgress) {
+          onProgress(
+            `IA do Google temporariamente ocupada. Nova tentativa automática em ${remaining}s.`,
+            null
+          );
+        }
+        await sleep(1000);
+      }
     }
 
-    const data = await response.json();
-    if (onProgress) {
-      onProgress('Concluído!', 100);
-    }
-    return data.analysis;
+    throw new Error(lastMessage);
   } finally {
-    if (progressInterval) {
-      clearInterval(progressInterval);
+    for (const timer of progressTimers) {
+      clearTimeout(timer);
     }
   }
 }

@@ -41,6 +41,40 @@ export function cleanPdfText(text: string | null | undefined): string {
     .trim();
 }
 
+const isPdfMetricAvailable = (value: any): boolean => {
+  if (value === null || value === undefined) return false;
+  const normalized = String(value)
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (!normalized) return false;
+
+  const invalid = [
+    '—', '-', 'n/d', 'nd', 'n/a', 'null', 'undefined',
+    'nao disponivel', 'indisponivel', 'nao identificado',
+    'sem dados', 'sem informacao', 'nao encontrado'
+  ];
+
+  return !invalid.some((token) => normalized === token || normalized.includes(token));
+};
+
+const cleanPdfMetric = (value: any): string =>
+  isPdfMetricAvailable(value) ? cleanPdfText(String(value)) : '';
+
+const cleanPdfHeatPercent = (value: any): string => {
+  if (!isPdfMetricAvailable(value)) return '';
+  const raw = String(value).trim().replace(',', '.');
+  const match = raw.match(/^(\d{1,3}(?:\.\d{1,2})?)\s*%?$/);
+  if (!match) return '';
+
+  const num = Number(match[1]);
+  if (!Number.isFinite(num) || num < 0 || num > 100) return '';
+
+  return `${Number.isInteger(num) ? num : Math.round(num * 10) / 10}%`;
+};
+
 /**
  * Gera o nome padrão do arquivo PDF para a análise.
  * Exemplo: ProTatica_Flamengo_x_Cruzeiro_2026.pdf
@@ -203,16 +237,23 @@ export function buildAnalysisPdfDocument(analysis: Analysis): {
   const adv = analysis.indicadoresAvancados || {};
   
   const statItems: { label: string; a: string; b: string }[] = [];
-  if (est.posseDeBola?.timeA || est.posseDeBola?.timeB) statItems.push({ label: 'Posse de Bola', a: cleanPdfText(est.posseDeBola?.timeA) || '—', b: cleanPdfText(est.posseDeBola?.timeB) || '—' });
-  if (est.finalizacoes?.timeA || est.finalizacoes?.timeB) statItems.push({ label: 'Finalizações', a: cleanPdfText(est.finalizacoes?.timeA) || '—', b: cleanPdfText(est.finalizacoes?.timeB) || '—' });
-  if (est.finalizacoesNoAlvo?.timeA || est.finalizacoesNoAlvo?.timeB) statItems.push({ label: 'Finalizações no Gol', a: cleanPdfText(est.finalizacoesNoAlvo?.timeA) || '—', b: cleanPdfText(est.finalizacoesNoAlvo?.timeB) || '—' });
-  if (adv.xG?.timeA || adv.xG?.timeB) statItems.push({ label: 'xG (Gols Esperados)', a: cleanPdfText(adv.xG?.timeA) || '—', b: cleanPdfText(adv.xG?.timeB) || '—' });
-  if (adv.grandesChances?.timeA || adv.grandesChances?.timeB) statItems.push({ label: 'Grandes Chances', a: cleanPdfText(adv.grandesChances?.timeA) || '—', b: cleanPdfText(adv.grandesChances?.timeB) || '—' });
-  if (est.passesCertos?.timeA || est.passesCertos?.timeB) statItems.push({ label: 'Passes Certos', a: cleanPdfText(est.passesCertos?.timeA) || '—', b: cleanPdfText(est.passesCertos?.timeB) || '—' });
-  if (est.desarmes?.timeA || est.desarmes?.timeB) statItems.push({ label: 'Desarmes', a: cleanPdfText(est.desarmes?.timeA) || '—', b: cleanPdfText(est.desarmes?.timeB) || '—' });
-  if (est.escanteios?.timeA || est.escanteios?.timeB) statItems.push({ label: 'Escanteios', a: cleanPdfText(est.escanteios?.timeA) || '—', b: cleanPdfText(est.escanteios?.timeB) || '—' });
-  if (est.faltasCometidas?.timeA || est.faltasCometidas?.timeB) statItems.push({ label: 'Faltas Cometidas', a: cleanPdfText(est.faltasCometidas?.timeA) || '—', b: cleanPdfText(est.faltasCometidas?.timeB) || '—' });
-  if (est.impedimentos?.timeA || est.impedimentos?.timeB) statItems.push({ label: 'Impedimentos', a: cleanPdfText(est.impedimentos?.timeA) || '—', b: cleanPdfText(est.impedimentos?.timeB) || '—' });
+  const pushMetric = (label: string, metric: any) => {
+    const a = cleanPdfMetric(metric?.timeA);
+    const b = cleanPdfMetric(metric?.timeB);
+    if (!a && !b) return;
+    statItems.push({ label, a: a || '—', b: b || '—' });
+  };
+
+  pushMetric('Posse de Bola', est.posseDeBola);
+  pushMetric('Finalizações', est.finalizacoes);
+  pushMetric('Finalizações no Gol', est.finalizacoesNoAlvo);
+  pushMetric('xG (Gols Esperados)', adv.xG);
+  pushMetric('Grandes Chances', adv.grandesChances);
+  pushMetric('Passes Certos', est.passesCertos);
+  pushMetric('Desarmes', est.desarmes);
+  pushMetric('Escanteios', est.escanteios);
+  pushMetric('Faltas Cometidas', est.faltasCometidas);
+  pushMetric('Impedimentos', est.impedimentos);
 
   if (statItems.length > 0) {
     checkPageBreak(35 + statItems.length * 6);
@@ -252,8 +293,24 @@ export function buildAnalysisPdfDocument(analysis: Analysis): {
   }
 
   // --- 5. MAPA DE CALOR TÁTICO (HEATMAP) ---
-  const calorA = est.mapaDeCalor?.timeA;
-  const calorB = est.mapaDeCalor?.timeB;
+  const calorAOriginal = est.mapaDeCalor?.timeA;
+  const calorBOriginal = est.mapaDeCalor?.timeB;
+
+  const calorA = calorAOriginal ? {
+    tercoDefensivo: cleanPdfHeatPercent(calorAOriginal.tercoDefensivo),
+    tercoMedio: cleanPdfHeatPercent(calorAOriginal.tercoMedio),
+    tercoOfensivo: cleanPdfHeatPercent(calorAOriginal.tercoOfensivo),
+  } : undefined;
+
+  const calorB = calorBOriginal ? {
+    tercoDefensivo: cleanPdfHeatPercent(calorBOriginal.tercoDefensivo),
+    tercoMedio: cleanPdfHeatPercent(calorBOriginal.tercoMedio),
+    tercoOfensivo: cleanPdfHeatPercent(calorBOriginal.tercoOfensivo),
+  } : undefined;
+
+  const hasCalorA = Boolean(calorA && (calorA.tercoDefensivo || calorA.tercoMedio || calorA.tercoOfensivo));
+  const hasCalorB = Boolean(calorB && (calorB.tercoDefensivo || calorB.tercoMedio || calorB.tercoOfensivo));
+
   checkPageBreak(40);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(10);
@@ -261,7 +318,7 @@ export function buildAnalysisPdfDocument(analysis: Analysis): {
   doc.text('[4] MAPA DE CALOR E OCUPAÇÃO ESPACIAL POR TERÇOS', margin, cursorY);
   cursorY += 5;
 
-  if (calorA || calorB) {
+  if (hasCalorA || hasCalorB) {
     const boxWidth = (contentWidth - 6) / 2;
     const boxHeight = 26;
 

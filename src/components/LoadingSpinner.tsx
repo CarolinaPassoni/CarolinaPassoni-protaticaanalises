@@ -50,7 +50,7 @@ const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({ step, pct }) => {
                 </div>
             )}
             <p className="text-sm text-yellow-200/60 max-w-xl">
-                O PROTÁTICA está em pleno processamento utilizando IA Multimodal do Gemini 3.5. A busca por referências e auditoria de lances via Google Search está em execução. Note que análises táticas completas podem levar até 2-3 minutos.
+                O PROTÁTICA está enviando o trecho público do YouTube diretamente ao Gemini 3.8 para análise multimodal. A pesquisa secundária está desativada para preservar a cota. O tempo varia conforme a duração do trecho e a demanda da API; mantenha esta tela aberta até a conclusão.
             </p>
         </div>
     );

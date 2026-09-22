@@ -14,21 +14,72 @@ if (production && (!tursoUrl || !tursoAuthToken)) {
   );
 }
 
-let database: Database;
-if (usingRemoteDatabase) {
-  database = new Database(tursoUrl, { authToken: tursoAuthToken });
-  console.log('[DB] Turso remoto configurado. Os dados não dependem do disco do Render.');
-} else {
+let database: any;
+
+const createDatabaseConnection = () => {
+  if (usingRemoteDatabase) {
+    return new Database(tursoUrl, { authToken: tursoAuthToken });
+  }
+
   const configuredDataDir = String(process.env.DATA_DIR || '').trim();
   const dataDir = configuredDataDir ? resolve(configuredDataDir) : resolve(process.cwd(), 'data');
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
   const dbPath = resolve(dataDir, 'protatica.sqlite');
-  database = new Database(dbPath);
-  database.exec('PRAGMA journal_mode = WAL;');
+  const localDatabase = new Database(dbPath);
+  localDatabase.exec('PRAGMA journal_mode = WAL;');
+  return localDatabase;
+};
+
+database = createDatabaseConnection();
+
+if (usingRemoteDatabase) {
+  console.log('[DB] Turso remoto configurado. Os dados não dependem do disco do Render.');
+} else {
+  const configuredDataDir = String(process.env.DATA_DIR || '').trim();
+  const dataDir = configuredDataDir ? resolve(configuredDataDir) : resolve(process.cwd(), 'data');
+  const dbPath = resolve(dataDir, 'protatica.sqlite');
   console.log(`[DB] SQLite local de desenvolvimento: ${dbPath}`);
 }
 
-export const db = database;
+const isExpiredRemoteStream = (error: any) =>
+  usingRemoteDatabase &&
+  /stream not found|hrana|closed stream|connection.*closed/i.test(
+    String(error?.message || error || '')
+  );
+
+const reconnectRemoteDatabase = () => {
+  database = createDatabaseConnection();
+  console.warn('[DB] Conexão Turso renovada automaticamente.');
+};
+
+const runWithReconnect = <T>(operation: () => T): T => {
+  try {
+    return operation();
+  } catch (error) {
+    if (!isExpiredRemoteStream(error)) throw error;
+    reconnectRemoteDatabase();
+    return operation();
+  }
+};
+
+// O driver síncrono mantém streams Hrana. O Turso pode expirar um stream de
+// uma instância ociosa; cada statement é preparado na conexão atual e repetido
+// uma vez após reconexão, sem exigir recarregar a página ou reiniciar o Render.
+export const db: any = {
+  exec(sql: string) {
+    return runWithReconnect(() => database.exec(sql));
+  },
+  prepare(sql: string) {
+    return {
+      run: (...args: any[]) =>
+        runWithReconnect(() => database.prepare(sql).run(...args)),
+      get: (...args: any[]) =>
+        runWithReconnect(() => database.prepare(sql).get(...args)),
+      all: (...args: any[]) =>
+        runWithReconnect(() => database.prepare(sql).all(...args)),
+    };
+  },
+};
 db.exec('PRAGMA foreign_keys = ON;');
 
 // --- SCHEMA & MIGRATIONS SYSTEM ---
@@ -433,17 +484,36 @@ const syncDatabaseSchema = () => {
   }
 
   // --- IDEMPOTENT MATCHES TABLE COLUMN SYNCHRONIZATION ---
-  // A URL do vídeo é necessária para que "Analisar esta partida" consiga
-  // preencher automaticamente o formulário de Nova Análise.
+  // Mantém no schema principal os campos usados pela integração API-Football.
   try {
     const matchCols: any[] = db.prepare("PRAGMA table_info(matches)").all();
     const matchColNames = new Set(matchCols.map((c) => c.name));
-    if (!matchColNames.has('video_url')) {
-      db.exec('ALTER TABLE matches ADD COLUMN video_url TEXT;');
-      console.log('[DB Migration] Adicionada coluna video_url na tabela matches.');
-    }
+    const addMatchColIfNotExists = (name: string, definition: string) => {
+      if (!matchColNames.has(name)) {
+        db.exec(`ALTER TABLE matches ADD COLUMN ${name} ${definition};`);
+        matchColNames.add(name);
+        console.log(`[DB Migration] Adicionada coluna '${name}' na tabela matches.`);
+      }
+    };
+
+    addMatchColIfNotExists('video_url', 'TEXT');
+    addMatchColIfNotExists('external_fixture_id', 'INTEGER');
+    addMatchColIfNotExists('source_provider', 'TEXT');
+    addMatchColIfNotExists('source_verified_at', 'TEXT');
+    addMatchColIfNotExists('kickoff_at', 'TEXT');
+    addMatchColIfNotExists('api_status', 'TEXT');
+    addMatchColIfNotExists('fixture_timezone', 'TEXT');
+    addMatchColIfNotExists('venue_city', 'TEXT');
+    addMatchColIfNotExists('video_source_title', 'TEXT');
+    addMatchColIfNotExists('video_published_at', 'TEXT');
+    addMatchColIfNotExists('video_verified_at', 'TEXT');
+    addMatchColIfNotExists('video_confidence', 'INTEGER DEFAULT 0');
+    addMatchColIfNotExists('video_lookup_attempted_at', 'TEXT');
+
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_external_fixture ON matches(external_fixture_id);');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_matches_kickoff ON matches(kickoff_at);');
   } catch (e: any) {
-    console.warn('[DB Migration] Falha ao sincronizar matches.video_url:', e.message);
+    console.warn('[DB Migration] Falha ao sincronizar campos oficiais de matches:', e.message);
   }
 
   // --- IDEMPOTENT PLAYER PHOTOS CACHE TABLE COLUMN SYNCHRONIZATION ---
@@ -1463,6 +1533,58 @@ export const getAnalysisById = (id: string, userId?: string) => {
   } catch {
     return null;
   }
+};
+
+export const updateAnalysisPayload = (id: string, analysis: any) => {
+  if (!id || !analysis) return false;
+
+  const existing: any = db.prepare(
+    'SELECT created_at FROM analyses WHERE id = ?'
+  ).get(id);
+
+  if (!existing) return false;
+
+  const createdAt = analysis.createdAt || existing.created_at || new Date().toISOString();
+  const payload = {
+    ...analysis,
+    analysisId: id,
+    createdAt,
+  };
+
+  let confidenceVal = String(
+    payload.verificacaoAuditoria?.nivelConfianca ||
+    payload.placarAuditoria?.confianca ||
+    'baixa'
+  ).trim().toLowerCase();
+
+  if (!['alta', 'media', 'baixa'].includes(confidenceVal)) confidenceVal = 'baixa';
+
+  db.prepare(`
+    UPDATE analyses
+       SET video_title = ?,
+           video_url = ?,
+           video_id = ?,
+           team_a = ?,
+           team_b = ?,
+           placar = ?,
+           confidence = ?,
+           strategy = ?,
+           payload_json = ?
+     WHERE id = ?
+  `).run(
+    payload.videoTitle || '',
+    payload.videoUrl || '',
+    payload.videoId || '',
+    payload.timeA || '',
+    payload.timeB || '',
+    payload.placar || '',
+    confidenceVal,
+    payload.verificacaoAuditoria?.estrategiaAnalise || '',
+    JSON.stringify(payload),
+    id
+  );
+
+  return true;
 };
 
 export const getPublicAnalysisById = (id: string) => {
@@ -2713,7 +2835,20 @@ export const listMatches = (filter?: {
       params.push(filter.status);
     }
 
-    query += ` ORDER BY m.is_featured DESC, datetime(m.created_at) DESC`;
+    query += `
+      ORDER BY
+        m.is_featured DESC,
+        CASE
+          WHEN m.status = 'live' THEN 0
+          WHEN m.status = 'scheduled' THEN 1
+          WHEN m.status = 'finished_waiting_video' THEN 2
+          WHEN m.status = 'finished' THEN 3
+          ELSE 4
+        END ASC,
+        CASE WHEN m.status IN ('live', 'scheduled') THEN datetime(m.kickoff_at) END ASC,
+        CASE WHEN m.status NOT IN ('live', 'scheduled') THEN datetime(m.kickoff_at) END DESC,
+        datetime(m.created_at) DESC
+    `;
 
     if (filter?.limit) {
       query += ` LIMIT ?`;
@@ -2733,6 +2868,11 @@ export const listMatches = (filter?: {
       awayTeamLogo: r.away_team_logo,
       videoUrl: r.video_url || '',
       matchDate: r.match_date,
+      kickoffAt: r.kickoff_at || null,
+      apiStatus: r.api_status || null,
+      sourceProvider: r.source_provider || null,
+      videoVerifiedAt: r.video_verified_at || null,
+      videoConfidence: Number(r.video_confidence || 0),
       round: r.round,
       stadium: r.stadium,
       status: r.status || 'scheduled',
@@ -3096,5 +3236,4 @@ export const listPublicAnalyses = (limit = 30) => {
     return [];
   }
 };
-
 

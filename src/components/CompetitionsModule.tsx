@@ -431,7 +431,7 @@ export const CompetitionsModule: React.FC<CompetitionsModuleProps> = ({
                           ) : (
                             <div className="flex-1 md:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-zinc-900/70 border border-zinc-800 text-zinc-400 font-bold text-xs rounded-xl">
                               <Clock className="w-4 h-4" />
-                              {match.status === 'live' ? 'EM ANDAMENTO' : 'AGUARDANDO VÍDEO'}
+                              {match.status === 'scheduled' ? 'PARTIDA AGENDADA' : match.status === 'live' ? 'EM ANDAMENTO' : 'AGUARDANDO VÍDEO'}
                             </div>
                           )}
                         </div>

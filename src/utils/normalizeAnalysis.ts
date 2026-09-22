@@ -14,10 +14,40 @@ export function parseOptionalNumber(val: any): number | null {
 /**
  * Checks if a metric string contains valid data (not empty, not purely whitespace).
  */
+const INVALID_METRIC_TOKENS = [
+  '',
+  '—',
+  '-',
+  'n/d',
+  'nd',
+  'n.a.',
+  'n/a',
+  'null',
+  'undefined',
+  'nao disponivel',
+  'indisponivel',
+  'nao identificado',
+  'sem dados',
+  'sem informacao',
+  'nao encontrado',
+];
+
+const normalizeComparableText = (val: any): string =>
+  String(val ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
 export function hasValue(val: any): boolean {
   if (val === null || val === undefined) return false;
-  const str = String(val).trim();
-  return str !== '' && str !== '—' && str !== '-' && str.toLowerCase() !== 'n/d' && str.toLowerCase() !== 'null';
+
+  const normalized = normalizeComparableText(val);
+  if (!normalized) return false;
+
+  return !INVALID_METRIC_TOKENS.some((token) =>
+    normalized === token || normalized.includes(token)
+  );
 }
 
 /**
@@ -26,6 +56,28 @@ export function hasValue(val: any): boolean {
 export function formatMetric(val: any, fallback = 'N/D'): string {
   if (!hasValue(val)) return fallback;
   return String(val).trim();
+}
+
+/**
+ * Heatmap por terços é dado quantitativo. Aceita apenas números de 0 a 100,
+ * com ou sem %, e normaliza para formato percentual.
+ * Frases qualitativas nunca entram nos cards/diagramas de percentual.
+ */
+export function normalizeHeatPercent(val: any): string | undefined {
+  if (!hasValue(val)) return undefined;
+
+  const raw = String(val).trim().replace(',', '.');
+  const match = raw.match(/^(\d{1,3}(?:\.\d{1,2})?)\s*%?$/);
+  if (!match) return undefined;
+
+  const num = Number(match[1]);
+  if (!Number.isFinite(num) || num < 0 || num > 100) return undefined;
+
+  const formatted = Number.isInteger(num)
+    ? String(num)
+    : String(Math.round(num * 10) / 10);
+
+  return `${formatted}%`;
 }
 
 /**
@@ -180,32 +232,53 @@ export function normalizeAnalysisResponse(raw: any): Analysis {
     },
   };
 
+  const cleanTacticalNarrative = (value: any): string | undefined => {
+    if (!hasValue(value)) return undefined;
+    const clean = String(value).trim();
+    const normalized = clean
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+
+    if (
+      normalized.includes('nao disponivel') ||
+      normalized.includes('indisponivel') ||
+      normalized.includes('nao identificado') ||
+      normalized.includes('evidencia insuficiente') ||
+      normalized === 'n/d'
+    ) {
+      return undefined;
+    }
+
+    return clean;
+  };
+
   // Normalize Phases
   const rawDef = raw.faseDefensiva || {};
   const faseDefensiva = {
     timeA: {
-      posicionamento: rawDef.timeA?.posicionamento || undefined,
-      compactacao_pressao: rawDef.timeA?.compactacao_pressao || undefined,
-      transicao: rawDef.timeA?.transicao || undefined,
+      posicionamento: cleanTacticalNarrative(rawDef.timeA?.posicionamento),
+      compactacao_pressao: cleanTacticalNarrative(rawDef.timeA?.compactacao_pressao),
+      transicao: cleanTacticalNarrative(rawDef.timeA?.transicao),
     },
     timeB: {
-      posicionamento: rawDef.timeB?.posicionamento || undefined,
-      compactacao_pressao: rawDef.timeB?.compactacao_pressao || undefined,
-      transicao: rawDef.timeB?.transicao || undefined,
+      posicionamento: cleanTacticalNarrative(rawDef.timeB?.posicionamento),
+      compactacao_pressao: cleanTacticalNarrative(rawDef.timeB?.compactacao_pressao),
+      transicao: cleanTacticalNarrative(rawDef.timeB?.transicao),
     },
   };
 
   const rawOf = raw.faseOfensiva || {};
   const faseOfensiva = {
     timeA: {
-      saidaDeBola: rawOf.timeA?.saidaDeBola || undefined,
-      criacao: rawOf.timeA?.criacao || undefined,
-      finalizacao_movimentacao: rawOf.timeA?.finalizacao_movimentacao || undefined,
+      saidaDeBola: cleanTacticalNarrative(rawOf.timeA?.saidaDeBola),
+      criacao: cleanTacticalNarrative(rawOf.timeA?.criacao),
+      finalizacao_movimentacao: cleanTacticalNarrative(rawOf.timeA?.finalizacao_movimentacao),
     },
     timeB: {
-      saidaDeBola: rawOf.timeB?.saidaDeBola || undefined,
-      criacao: rawOf.timeB?.criacao || undefined,
-      finalizacao_movimentacao: rawOf.timeB?.finalizacao_movimentacao || undefined,
+      saidaDeBola: cleanTacticalNarrative(rawOf.timeB?.saidaDeBola),
+      criacao: cleanTacticalNarrative(rawOf.timeB?.criacao),
+      finalizacao_movimentacao: cleanTacticalNarrative(rawOf.timeB?.finalizacao_movimentacao),
     },
   };
 
@@ -238,25 +311,34 @@ export function normalizeAnalysisResponse(raw: any): Analysis {
     };
   };
 
-  // Normalize Heatmap: only include if real non-zero thirds exist
+  // Normalize Heatmap: somente percentuais válidos entram no mapa.
   let mapaDeCalorNormalized: { timeA?: MapaDeCalor; timeB?: MapaDeCalor } | undefined = undefined;
   if (rawStats.mapaDeCalor) {
     const rawCalorA = rawStats.mapaDeCalor.timeA;
     const rawCalorB = rawStats.mapaDeCalor.timeB;
-    const hasA = rawCalorA && (hasValue(rawCalorA.tercoDefensivo) || hasValue(rawCalorA.tercoMedio) || hasValue(rawCalorA.tercoOfensivo));
-    const hasB = rawCalorB && (hasValue(rawCalorB.tercoDefensivo) || hasValue(rawCalorB.tercoMedio) || hasValue(rawCalorB.tercoOfensivo));
+
+    const aDef = normalizeHeatPercent(rawCalorA?.tercoDefensivo);
+    const aMed = normalizeHeatPercent(rawCalorA?.tercoMedio);
+    const aOf = normalizeHeatPercent(rawCalorA?.tercoOfensivo);
+
+    const bDef = normalizeHeatPercent(rawCalorB?.tercoDefensivo);
+    const bMed = normalizeHeatPercent(rawCalorB?.tercoMedio);
+    const bOf = normalizeHeatPercent(rawCalorB?.tercoOfensivo);
+
+    const hasA = Boolean(aDef || aMed || aOf);
+    const hasB = Boolean(bDef || bMed || bOf);
 
     if (hasA || hasB) {
       mapaDeCalorNormalized = {
         timeA: hasA ? {
-          tercoDefensivo: rawCalorA?.tercoDefensivo ? String(rawCalorA.tercoDefensivo) : undefined,
-          tercoMedio: rawCalorA?.tercoMedio ? String(rawCalorA.tercoMedio) : undefined,
-          tercoOfensivo: rawCalorA?.tercoOfensivo ? String(rawCalorA.tercoOfensivo) : undefined,
+          tercoDefensivo: aDef,
+          tercoMedio: aMed,
+          tercoOfensivo: aOf,
         } : undefined,
         timeB: hasB ? {
-          tercoDefensivo: rawCalorB?.tercoDefensivo ? String(rawCalorB.tercoDefensivo) : undefined,
-          tercoMedio: rawCalorB?.tercoMedio ? String(rawCalorB.tercoMedio) : undefined,
-          tercoOfensivo: rawCalorB?.tercoOfensivo ? String(rawCalorB.tercoOfensivo) : undefined,
+          tercoDefensivo: bDef,
+          tercoMedio: bMed,
+          tercoOfensivo: bOf,
         } : undefined,
       };
     }

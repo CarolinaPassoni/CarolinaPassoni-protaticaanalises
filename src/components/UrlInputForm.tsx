@@ -15,7 +15,7 @@ interface UrlInputFormProps {
     initialUrl?: string;
 }
 
-type ClipPreset = 'first15' | 'first30' | 'first45' | 'second45' | 'fullMatch' | 'custom';
+type ClipPreset = 'first5' | 'first15' | 'first30' | 'first45' | 'second45' | 'fullMatch' | 'custom';
 
 const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initialUrl }) => {
     const { t, language } = useLanguage();
@@ -28,7 +28,7 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
     }, [initialUrl]);
     const [urlError, setUrlError] = useState<string | null>(null);
     const [mode, setMode] = useState<AnalysisMode>('quick');
-    const [clipPreset, setClipPreset] = useState<ClipPreset>('first15');
+    const [clipPreset, setClipPreset] = useState<ClipPreset>('first5');
     const [customStartMin, setCustomStartMin] = useState('0');
     const [customEndMin, setCustomEndMin] = useState('15');
     const [inputMethod, setInputMethod] = useState<'url' | 'file'>('url');
@@ -66,11 +66,17 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
     }, [url]);
 
     const clipOptions = useMemo(() => ({
+        first5: {
+            label: language === 'pt' ? 'Teste rápido: primeiros 5 minutos' : language === 'en' ? 'Quick test: first 5 minutes' : 'Prueba rápida: primeros 5 minutos',
+            start: 0,
+            end: 300,
+            hint: language === 'pt' ? 'Recomendado para validar a análise nativa do vídeo com menor tempo de processamento.' : language === 'en' ? 'Recommended to validate native video analysis with shorter processing time.' : 'Recomendado para validar el análisis nativo con menor tiempo de procesamiento.'
+        },
         first15: { 
             label: t('clipFirst15'), 
             start: 0, 
             end: 900, 
-            hint: language === 'pt' ? 'Mais rápido e recomendado para testar.' : language === 'en' ? 'Fastest and recommended for testing.' : 'Más rápido y recomendado para probar.' 
+            hint: language === 'pt' ? 'Análise mais ampla; pode levar vários minutos no processamento nativo.' : language === 'en' ? 'Broader analysis; native processing may take several minutes.' : 'Análisis más amplio; el procesamiento nativo puede tardar varios minutos.' 
         },
         first30: { 
             label: t('clipFirst30'), 
@@ -269,6 +275,7 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
                                     disabled={isLoading}
                                     className="w-full bg-[#260101] border border-yellow-800/60 rounded-md px-3 py-2 text-yellow-101 outline-none focus:ring-2 focus:ring-yellow-500"
                                 >
+                                    <option value="first5">{language === 'pt' ? 'Teste rápido: primeiros 5 minutos' : language === 'en' ? 'Quick test: first 5 minutes' : 'Prueba rápida: primeros 5 minutos'}</option>
                                     <option value="first15">{t('clipFirst15')}</option>
                                     <option value="first30">{t('clipFirst30')}</option>
                                     <option value="first45">{t('clipFirst45')}</option>
