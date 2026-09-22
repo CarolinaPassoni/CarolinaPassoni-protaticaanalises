@@ -370,13 +370,11 @@ patchTextFile('server.ts', (text) => {
       tacticalNarrativeOk(parsed?.faseOfensiva?.timeB?.finalizacao_movimentacao)
     );
 
-    const needsTacticalCompletion =
-      useNativeYouTubeVideo &&
-      (!possessionComplete ||
-        !finishingComplete ||
-        !heatmapComplete ||
-        !defensiveComplete ||
-        !offensiveComplete);
+    // O passe principal pode devolver valores aparentemente válidos que são
+    // removidos depois pela normalização. Para vídeo nativo, o passe focado é
+    // sempre executado antes de salvar e passa a ser a fonte definitiva das
+    // métricas e das fases táticas.
+    const needsTacticalCompletion = useNativeYouTubeVideo;
 
     if (needsTacticalCompletion) {
       console.log(
