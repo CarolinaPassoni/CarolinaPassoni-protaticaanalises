@@ -177,11 +177,10 @@ const getGeminiFailoverPlan = (primaryModel?: string): string[] => {
   return Array.from(
     new Set(
       [
-        'gemini-3.6-flash',
+        primary,
+        GEMINI_FALLBACK_MODEL,
         'gemini-3.5-flash-lite',
         'gemini-3.5-flash',
-        GEMINI_FALLBACK_MODEL,
-        primary,
       ]
         .map((model) => sanitizeModelName(model))
         .filter(Boolean)
@@ -309,15 +308,9 @@ const generateGeminiResilient = async (
 
   let lastError: any = null;
 
-  // Primeira rodada: troca IMEDIATAMENTE de modelo em 429/503/timeout.
-  // Segunda rodada: só acontece se todos os modelos falharem.
-  for (let round = 1; round <= 2; round++) {
-    if (round === 2) {
-      await geminiBackoffDelay(round);
-      console.warn(
-        `[GEMINI_FAILOVER] label=${label} iniciando segunda rodada após falha de todos os modelos`
-      );
-    }
+  // Uma rodada é suficiente: repetir todos os modelos duplica custo/cota sem
+  // melhorar respostas quando o limite diário já foi atingido.
+  for (let round = 1; round <= 1; round++) {
 
     for (const model of modelPlan) {
       const cooldownUntil = geminiModelCooldownUntil.get(model) || 0;
@@ -1399,6 +1392,7 @@ const RESPONSE_SCHEMA = {
   properties: {
     timeA: { type: Type.STRING },
     timeB: { type: Type.STRING },
+    trechoComJogoEmAndamento: { type: Type.BOOLEAN },
     identidadeVideo: {
       type: Type.OBJECT,
       properties: {
@@ -1508,21 +1502,24 @@ const RESPONSE_SCHEMA = {
           properties: {
             timeA: { type: Type.STRING },
             timeB: { type: Type.STRING }
-          }
+          },
+          required: ['timeA', 'timeB']
         },
         finalizacoes: {
           type: Type.OBJECT,
           properties: {
             timeA: { type: Type.STRING },
             timeB: { type: Type.STRING }
-          }
+          },
+          required: ['timeA', 'timeB']
         },
         finalizacoesNoAlvo: {
           type: Type.OBJECT,
           properties: {
             timeA: { type: Type.STRING },
             timeB: { type: Type.STRING }
-          }
+          },
+          required: ['timeA', 'timeB']
         },
         passesCertos: {
           type: Type.OBJECT,
@@ -1568,7 +1565,8 @@ const RESPONSE_SCHEMA = {
                 tercoDefensivo: { type: Type.STRING },
                 tercoMedio: { type: Type.STRING },
                 tercoOfensivo: { type: Type.STRING }
-              }
+              },
+              required: ['tercoDefensivo', 'tercoMedio', 'tercoOfensivo']
             },
             timeB: {
               type: Type.OBJECT,
@@ -1576,11 +1574,14 @@ const RESPONSE_SCHEMA = {
                 tercoDefensivo: { type: Type.STRING },
                 tercoMedio: { type: Type.STRING },
                 tercoOfensivo: { type: Type.STRING }
-              }
+              },
+              required: ['tercoDefensivo', 'tercoMedio', 'tercoOfensivo']
             }
-          }
+          },
+          required: ['timeA', 'timeB']
         }
-      }
+      },
+      required: ['posseDeBola', 'finalizacoes', 'finalizacoesNoAlvo', 'mapaDeCalor']
     },
     indicadoresAvancados: {
       type: Type.OBJECT,
@@ -1590,14 +1591,16 @@ const RESPONSE_SCHEMA = {
           properties: {
             timeA: { type: Type.STRING },
             timeB: { type: Type.STRING }
-          }
+          },
+          required: ['timeA', 'timeB']
         },
         grandesChances: {
           type: Type.OBJECT,
           properties: {
             timeA: { type: Type.STRING },
             timeB: { type: Type.STRING }
-          }
+          },
+          required: ['timeA', 'timeB']
         },
         passesTercoFinal: {
           type: Type.OBJECT,
@@ -1606,7 +1609,8 @@ const RESPONSE_SCHEMA = {
             timeB: { type: Type.STRING }
           }
         }
-      }
+      },
+      required: ['xG', 'grandesChances']
     },
     analiseJogadores: {
       type: Type.ARRAY,
@@ -1663,6 +1667,7 @@ const RESPONSE_SCHEMA = {
   required: [
     'timeA',
     'timeB',
+    'trechoComJogoEmAndamento',
     'identidadeVideo',
     'placar',
     'placarAuditoria',
@@ -3813,6 +3818,10 @@ EVIDÊNCIA PRIMÁRIA AUDIOVISUAL:
 ${evidence.hasTranscript ? `\nTRANSCRIÇÃO DE ÁUDIO COM MINUTAGEM DO TRECHO (${startSec}s a ${endSec}s, modo ${analysisMode}):\n${evidence.transcriptFullText.slice(0, 4500)}` : '\nTranscrição textual: Não disponível diretamente no trecho.'}
 
 DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
+0.0. DETECÇÃO DE JOGO ATIVO:
+   - Preencha trechoComJogoEmAndamento=true somente se o trecho mostrar futebol sendo efetivamente jogado por tempo suficiente para medir posse, finalizações e ocupação territorial.
+   - Vinheta, apresentação, entrevista, escalação, aquecimento, intervalo ou tela estática devem retornar trechoComJogoEmAndamento=false.
+   - Não invente métricas quando trechoComJogoEmAndamento=false.
 0. PORTÃO DE IDENTIDADE OBRIGATÓRIO:
    - Antes de qualquer análise tática, identifique VISUALMENTE quais equipes aparecem no vídeo atual.
    - Preencha identidadeVideo.timeAObservado e identidadeVideo.timeBObservado com o que você realmente reconhece no conteúdo visual.
@@ -3874,6 +3883,16 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     const parsed = parseJsonResponse(rawText);
     if (!parsed) throw new Error('Falha ao processar o formato da análise. Tente novamente.');
+
+    if (parsed.trechoComJogoEmAndamento !== true) {
+      const gameplayError: any = new Error(
+        `O trecho ${formatSecondsToTimestamp(startSec)}–${formatSecondsToTimestamp(endSec)} não contém jogo em andamento suficiente para calcular as métricas. Escolha um intervalo em que a bola esteja em jogo.`
+      );
+      gameplayError.code = 'NO_GAMEPLAY_IN_CLIP';
+      gameplayError.status = 422;
+      gameplayError.retryable = false;
+      throw gameplayError;
+    }
 
     // --- ETAPA 5: PORTÃO DE IDENTIDADE + SANITIZAÇÃO ---
     // NUNCA sobrescreva os nomes reportados pela IA antes desta validação.
@@ -4025,6 +4044,30 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
           `[TACTICAL_COMPLETION] warning=${String(completionErr?.message || completionErr).slice(0, 280)}`
         );
       }
+    }
+
+    const finalCoreMetricsComplete = Boolean(
+      metricPairComplete(parsed?.estatisticas?.posseDeBola) &&
+      metricPairComplete(parsed?.estatisticas?.finalizacoes) &&
+      metricPairComplete(parsed?.estatisticas?.finalizacoesNoAlvo) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.xG) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.grandesChances) &&
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio &&
+      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio &&
+      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo
+    );
+
+    if (!finalCoreMetricsComplete) {
+      const metricsError: any = new Error(
+        'A IA não conseguiu concluir as métricas obrigatórias deste trecho. O relatório incompleto não foi salvo. Escolha um trecho com jogo ativo ou aguarde a liberação da cota da IA.'
+      );
+      metricsError.code = 'INCOMPLETE_VIDEO_METRICS';
+      metricsError.status = 422;
+      metricsError.retryable = false;
+      throw metricsError;
     }
 
     if (!parsed.contextoPartida) parsed.contextoPartida = {};
@@ -4185,6 +4228,14 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
         retryable: false,
         expectedTeams: err.expectedTeams || [],
         observedTeams: err.observedTeams || [],
+      });
+    }
+
+    if (err?.code === 'NO_GAMEPLAY_IN_CLIP' || err?.code === 'INCOMPLETE_VIDEO_METRICS') {
+      return res.status(422).json({
+        error: err.message,
+        code: err.code,
+        retryable: false,
       });
     }
 

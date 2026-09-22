@@ -513,7 +513,7 @@ export interface Match {
   matchDate: string;
   round?: string;
   stadium?: string;
-  status: 'scheduled' | 'finished' | 'live';
+  status: 'scheduled' | 'finished' | 'live' | 'finished_waiting_video';
   analysisId?: string | null;
   isFeatured: boolean;
   featuredPlayerName?: string;
@@ -542,4 +542,3 @@ export interface PlayerCatalogItem {
   createdAt?: string;
   updatedAt?: string;
 }
-

@@ -18,7 +18,9 @@ let database: any;
 
 const createDatabaseConnection = () => {
   if (usingRemoteDatabase) {
-    return new Database(tursoUrl, { authToken: tursoAuthToken });
+    // O runtime libsql aceita authToken para conexões remotas, embora a
+    // declaração de tipos desta versão ainda não exponha essa opção.
+    return new Database(tursoUrl, { authToken: tursoAuthToken } as any);
   }
 
   const configuredDataDir = String(process.env.DATA_DIR || '').trim();
@@ -3236,4 +3238,3 @@ export const listPublicAnalyses = (limit = 30) => {
     return [];
   }
 };
-

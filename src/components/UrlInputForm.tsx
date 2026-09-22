@@ -15,7 +15,7 @@ interface UrlInputFormProps {
     initialUrl?: string;
 }
 
-type ClipPreset = 'first5' | 'first15' | 'first30' | 'first45' | 'second45' | 'fullMatch' | 'custom';
+type ClipPreset = 'game15to30' | 'first5' | 'first15' | 'first30' | 'first45' | 'second45' | 'fullMatch' | 'custom';
 
 const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initialUrl }) => {
     const { t, language } = useLanguage();
@@ -28,7 +28,7 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
     }, [initialUrl]);
     const [urlError, setUrlError] = useState<string | null>(null);
     const [mode, setMode] = useState<AnalysisMode>('quick');
-    const [clipPreset, setClipPreset] = useState<ClipPreset>('first5');
+    const [clipPreset, setClipPreset] = useState<ClipPreset>('game15to30');
     const [customStartMin, setCustomStartMin] = useState('0');
     const [customEndMin, setCustomEndMin] = useState('15');
     const [inputMethod, setInputMethod] = useState<'url' | 'file'>('url');
@@ -66,11 +66,17 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
     }, [url]);
 
     const clipOptions = useMemo(() => ({
+        game15to30: {
+            label: language === 'pt' ? 'Recomendado: jogo entre 15 e 30 minutos' : language === 'en' ? 'Recommended: gameplay from 15 to 30 minutes' : 'Recomendado: juego entre 15 y 30 minutos',
+            start: 900,
+            end: 1800,
+            hint: language === 'pt' ? 'Evita a abertura da transmissão e aumenta a chance de analisar bola em jogo.' : language === 'en' ? 'Skips the broadcast intro and is more likely to contain active play.' : 'Evita la apertura de la transmisión y aumenta la posibilidad de analizar juego activo.'
+        },
         first5: {
-            label: language === 'pt' ? 'Teste rápido: primeiros 5 minutos' : language === 'en' ? 'Quick test: first 5 minutes' : 'Prueba rápida: primeros 5 minutos',
+            label: language === 'pt' ? 'Abertura: primeiros 5 minutos' : language === 'en' ? 'Opening: first 5 minutes' : 'Apertura: primeros 5 minutos',
             start: 0,
             end: 300,
-            hint: language === 'pt' ? 'Recomendado para validar a análise nativa do vídeo com menor tempo de processamento.' : language === 'en' ? 'Recommended to validate native video analysis with shorter processing time.' : 'Recomendado para validar el análisis nativo con menor tiempo de procesamiento.'
+            hint: language === 'pt' ? 'Pode conter apenas vinheta, apresentação ou aquecimento e não gerar métricas.' : language === 'en' ? 'May contain only intro, presentation or warm-up and produce no metrics.' : 'Puede contener solo apertura, presentación o calentamiento y no generar métricas.'
         },
         first15: { 
             label: t('clipFirst15'), 
@@ -275,6 +281,7 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
                                     disabled={isLoading}
                                     className="w-full bg-[#260101] border border-yellow-800/60 rounded-md px-3 py-2 text-yellow-101 outline-none focus:ring-2 focus:ring-yellow-500"
                                 >
+                                    <option value="game15to30">{language === 'pt' ? 'Recomendado: jogo entre 15 e 30 minutos' : language === 'en' ? 'Recommended: gameplay from 15 to 30 minutes' : 'Recomendado: juego entre 15 y 30 minutos'}</option>
                                     <option value="first5">{language === 'pt' ? 'Teste rápido: primeiros 5 minutos' : language === 'en' ? 'Quick test: first 5 minutes' : 'Prueba rápida: primeros 5 minutos'}</option>
                                     <option value="first15">{t('clipFirst15')}</option>
                                     <option value="first30">{t('clipFirst30')}</option>

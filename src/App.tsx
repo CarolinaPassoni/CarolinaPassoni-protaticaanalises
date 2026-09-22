@@ -133,7 +133,7 @@ const App: React.FC = () => {
     const [smtpTestStatus, setSmtpTestStatus] = useState('');
 
     // Estado administrativo de gerenciamento de usuários / acessos
-    const [usersList, setUsersList] = useState<{ id: string; username: string; displayName: string; createdAt: string }[]>([]);
+    const [usersList, setUsersList] = useState<{ id: string; username: string; displayName: string; createdAt: string; role?: 'admin' | 'user' }[]>([]);
     const [isUsersLoading, setIsUsersLoading] = useState(false);
     const [newUsername, setNewUsername] = useState('');
     const [newDisplayName, setNewDisplayName] = useState('');

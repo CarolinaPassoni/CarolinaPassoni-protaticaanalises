@@ -242,7 +242,10 @@ export async function analyzeFootballMatch(
   };
 
   try {
-    const maxCycles = 3;
+    // Uma análise de vídeo já possui failover no servidor. Reenviar a análise
+    // inteira pelo navegador multiplicava o consumo de cota e criava relatórios
+    // concorrentes para o mesmo vídeo.
+    const maxCycles = 1;
     let lastMessage = 'A inteligência artificial está temporariamente indisponível.';
 
     for (let cycle = 1; cycle <= maxCycles; cycle++) {
