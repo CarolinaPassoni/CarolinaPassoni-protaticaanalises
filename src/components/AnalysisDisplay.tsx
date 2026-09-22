@@ -618,7 +618,6 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
   const [isRecalculatingMetrics, setIsRecalculatingMetrics] = React.useState(false);
   const [metricsMessage, setMetricsMessage] = React.useState('');
   const [, setMetricsRevision] = React.useState(0);
-  const automaticCompletionAttemptRef = React.useRef<string | null>(null);
   
   // Translating States
   const [isTranslating, setIsTranslating] = React.useState(false);
@@ -808,16 +807,8 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ analysis, onGenerateT
     )
   );
 
-  // Análises antigas incompletas são complementadas automaticamente ao abrir.
-  // Uma tentativa por montagem evita chamadas duplicadas ou loop em caso de falha.
-  React.useEffect(() => {
-    const analysisId = String(analysis.analysisId || '').trim();
-    if (!needsMetricRecalc || !analysisId || isRecalculatingMetrics) return;
-    if (automaticCompletionAttemptRef.current === analysisId) return;
-
-    automaticCompletionAttemptRef.current = analysisId;
-    void handleRecalculateMetrics();
-  }, [analysis.analysisId, needsMetricRecalc]);
+  // Não reprocessar automaticamente ao abrir o relatório. A análise inicial já
+  // usa o vídeo; repetir a chamada aqui gastava cota e causava 429/“indisponível”.
 
   const contexto = analysis.contextoPartida;
   const verificacao = analysis.verificacaoAuditoria;

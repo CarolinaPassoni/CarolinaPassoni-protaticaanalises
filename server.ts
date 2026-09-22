@@ -3419,6 +3419,12 @@ const identityPairCompatible = (
   return { ok: swapped, swapped };
 };
 
+const canonicalScore = (value: any): string | null => {
+  const clean = String(value || '').trim();
+  const match = clean.match(/(?:^|\s)(\d{1,2})\s*[-xX×:]\s*(\d{1,2})(?:\s|$)/);
+  return match ? `${Number(match[1])} x ${Number(match[2])}` : null;
+};
+
 // --- REAL VIDEO & MULTIMODAL ANALYSIS PIPELINE ---
 app.post('/api/analyze', requireAuth, requireActiveSubscription, upload.single('videoFile'), async (req, res) => {
   // Logs de requisição de análise
@@ -3979,11 +3985,14 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
       tacticalNarrativeOk(parsed?.faseOfensiva?.timeB?.finalizacao_movimentacao)
     );
 
-    // O passe principal pode devolver valores aparentemente válidos que são
-    // removidos depois pela normalização. Para vídeo nativo, o passe focado é
-    // sempre executado antes de salvar e passa a ser a fonte definitiva das
-    // métricas e das fases táticas.
-    const needsTacticalCompletion = useNativeYouTubeVideo;
+    // A resposta principal já analisa o vídeo e normalmente contém estas
+    // métricas. Um segundo passe só é permitido quando algo realmente faltou;
+    // isso evita duplicar consumo de cota e gerar 429 desnecessariamente.
+    const needsTacticalCompletion = Boolean(
+      useNativeYouTubeVideo &&
+      (!possessionComplete || !finishingComplete || !heatmapComplete ||
+        !defensiveComplete || !offensiveComplete)
+    );
 
     if (needsTacticalCompletion) {
       console.log(
@@ -4026,13 +4035,31 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     parsed.contextoPartida.cidade = searchData?.cidade || parsed.contextoPartida.cidade || 'Não identificada';
 
     // 5 Fontes separadas de auditoria do placar
-    const visualScore = parsed.placarAuditoria?.placarVisivel || null;
+    const visualScore = canonicalScore(parsed.placarAuditoria?.placarVisivel);
     const officialScore = searchData?.placarReal && searchData.placarReal !== 'Não identificado' ? searchData.placarReal : null;
     const transcriptScore = null;
     const aiInferenceScore = parsed.placar || null;
     const metadataScore = officialScore;
 
     if (!parsed.placarAuditoria) parsed.placarAuditoria = {};
+
+    // Para uma análise de vídeo, o placar exibido no próprio conteúdo é a
+    // referência primária. Nunca deixe uma inferência ou pesquisa secundária
+    // substituir um placar visual válido.
+    if (visualScore) {
+      parsed.placar = visualScore;
+      parsed.placarAuditoria.placarVisivel = visualScore;
+      parsed.placarAuditoria.placarFinal = visualScore;
+      parsed.placarAuditoria.fontePlacar = 'Placar visível no vídeo analisado';
+
+      const officialCanonical = canonicalScore(officialScore);
+      if (officialCanonical && officialCanonical !== visualScore) {
+        parsed.placarAuditoria.observacoes =
+          `Conflito de fontes: o vídeo mostra ${visualScore}; a fonte secundária informou ${officialCanonical}. O relatório usa o placar do vídeo.`;
+        sectionValidation.score = 'partial';
+      }
+    }
+
     parsed.placarAuditoria.scoreEvidence = {
       videoVisual: visualScore,
       visual: visualScore,
@@ -4113,10 +4140,7 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     if (expectedIdentityIsStrict && visualIdentityConfirmed && identityMatch.ok) {
       normalized.validationStatus = 'verified';
-      normalized.sectionValidation = {
-        ...(normalized.sectionValidation || {}),
-        matchIdentity: 'verified',
-      };
+      normalized.sectionValidation.matchIdentity = 'verified';
       if (normalized.verificacaoAuditoria) {
         normalized.verificacaoAuditoria.nivelConfianca =
           normalized.verificacaoAuditoria.nivelConfianca === 'baixa'
