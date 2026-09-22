@@ -323,9 +323,25 @@ patchTextFile('server.ts', (text) => {
     const insertion = `    const tacticalNarrativeOk = (value: any) =>
       Boolean(cleanTacticalSupplementText(value));
 
-    const possessionComplete =
-      Number.isFinite(Number(String(parsed?.estatisticas?.posseDeBola?.timeA || '').replace('%', ''))) &&
-      Number.isFinite(Number(String(parsed?.estatisticas?.posseDeBola?.timeB || '').replace('%', '')));
+    // Number('') retorna 0. A checagem antiga tratava campo vazio como dado
+    // válido e impedia o complemento automático.
+    const metricValuePresent = (value: any) => {
+      if (value === null || value === undefined) return false;
+      const clean = String(value).replace('%', '').replace(',', '.').trim();
+      return clean !== '' && Number.isFinite(Number(clean));
+    };
+
+    const metricPairComplete = (pair: any) =>
+      metricValuePresent(pair?.timeA) && metricValuePresent(pair?.timeB);
+
+    const possessionComplete = metricPairComplete(parsed?.estatisticas?.posseDeBola);
+
+    const finishingComplete = Boolean(
+      metricPairComplete(parsed?.estatisticas?.finalizacoes) &&
+      metricPairComplete(parsed?.estatisticas?.finalizacoesNoAlvo) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.xG) &&
+      metricPairComplete(parsed?.indicadoresAvancados?.grandesChances)
+    );
 
     const heatmapComplete = Boolean(
       parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo &&
@@ -356,11 +372,15 @@ patchTextFile('server.ts', (text) => {
 
     const needsTacticalCompletion =
       useNativeYouTubeVideo &&
-      (!possessionComplete || !heatmapComplete || !defensiveComplete || !offensiveComplete);
+      (!possessionComplete ||
+        !finishingComplete ||
+        !heatmapComplete ||
+        !defensiveComplete ||
+        !offensiveComplete);
 
     if (needsTacticalCompletion) {
       console.log(
-        \`[TACTICAL_COMPLETION] start possession=\${possessionComplete} heatmap=\${heatmapComplete} defensive=\${defensiveComplete} offensive=\${offensiveComplete}\`
+        \`[TACTICAL_COMPLETION] start possession=\${possessionComplete} finishing=\${finishingComplete} heatmap=\${heatmapComplete} defensive=\${defensiveComplete} offensive=\${offensiveComplete}\`
       );
 
       try {
@@ -425,10 +445,10 @@ patchTextFile('server.ts', (text) => {
 });
 
 // ============================================================================
-// FRONTEND: o botão passa a completar números + ataque + defesa.
+// FRONTEND: completa automaticamente números + ataque + defesa, sem botão.
 // ============================================================================
 patchTextFile('src/components/AnalysisDisplay.tsx', (text) => {
-  // Flags táticas para liberar o botão também quando ataque/defesa estiverem vazios.
+  // Flags táticas para identificar automaticamente análises incompletas.
   if (!text.includes('const hasDefensiveTacticalAnalysis =')) {
     const marker = `  const needsMetricRecalc = Boolean(`;
     const helper = `  const hasDefensiveTacticalAnalysis = Boolean(
@@ -455,15 +475,57 @@ patchTextFile('src/components/AnalysisDisplay.tsx', (text) => {
 
   text = text.replace(
     `      !hasHeatmapThirds`,
-    `      !hasHeatmapThirds ||
+    `      !hasValue(analysis.estatisticas?.finalizacoesNoAlvo?.timeA) ||
+      !hasValue(analysis.estatisticas?.finalizacoesNoAlvo?.timeB) ||
+      !hasValue(analysis.indicadoresAvancados?.xG?.timeA) ||
+      !hasValue(analysis.indicadoresAvancados?.xG?.timeB) ||
+      !hasValue(analysis.indicadoresAvancados?.grandesChances?.timeA) ||
+      !hasValue(analysis.indicadoresAvancados?.grandesChances?.timeB) ||
+      !hasHeatmapThirds ||
       !hasDefensiveTacticalAnalysis ||
       !hasOffensiveTacticalAnalysis`
   );
+
+  if (!text.includes('automaticCompletionAttemptRef')) {
+    text = text.replace(
+      `  const [, setMetricsRevision] = React.useState(0);`,
+      `  const [, setMetricsRevision] = React.useState(0);
+  const automaticCompletionAttemptRef = React.useRef<string | null>(null);`
+    );
+  }
+
+  if (!text.includes('Análises antigas incompletas são complementadas')) {
+    const marker = `  const contexto = analysis.contextoPartida;`;
+    const effect = `  // Análises antigas incompletas são complementadas automaticamente ao abrir.
+  // Uma tentativa por montagem evita chamadas duplicadas ou loop em caso de falha.
+  React.useEffect(() => {
+    const analysisId = String(analysis.analysisId || '').trim();
+    if (!needsMetricRecalc || !analysisId || isRecalculatingMetrics) return;
+    if (automaticCompletionAttemptRef.current === analysisId) return;
+
+    automaticCompletionAttemptRef.current = analysisId;
+    void handleRecalculateMetrics();
+  }, [analysis.analysisId, needsMetricRecalc]);
+
+`;
+    if (text.includes(marker)) text = text.replace(marker, effect + marker);
+  }
 
   text = text.replace(
     `Gemini analisando novamente o trecho para calcular as métricas...`,
     `Gemini analisando novamente o trecho para completar métricas, fase ofensiva e fase defensiva...`
   );
+
+  // A interface não pede nenhuma ação do usuário. O mesmo endpoint usado pelo
+  // botão antigo é acionado pelo efeito automático acima.
+  const buttonStart = text.indexOf(`          {needsMetricRecalc && (`);
+  const telegramStart = text.indexOf(
+    `          <button\n            id="btn-telegram-publish"`,
+    buttonStart
+  );
+  if (buttonStart >= 0 && telegramStart > buttonStart) {
+    text = text.slice(0, buttonStart) + text.slice(telegramStart);
+  }
 
   text = text.replace(
     `Métricas do trecho recalculadas e salvas. Valores marcados como estimativa visual da IA.`,
@@ -488,7 +550,7 @@ patchTextFile('src/components/AnalysisDisplay.tsx', (text) => {
       `<AnalysisCard title={loc[currentLang].defendingPhase} icon={<TacticIcon />}>
             {!hasDefensiveTacticalAnalysis && (
               <div className="mb-5 rounded-xl border border-amber-800/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
-                Fase defensiva ainda não foi completada nesta análise. Use “Completar métricas e análise tática” para reprocessar o trecho do vídeo.
+                O sistema está completando automaticamente a fase defensiva a partir do trecho do vídeo.
               </div>
             )}
             <div className="grid md:grid-cols-2 gap-8">`
@@ -502,7 +564,7 @@ patchTextFile('src/components/AnalysisDisplay.tsx', (text) => {
       `<AnalysisCard title={loc[currentLang].offensivePhase} icon={<TacticIcon />}>
             {!hasOffensiveTacticalAnalysis && (
               <div className="mb-5 rounded-xl border border-amber-800/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
-                Fase ofensiva ainda não foi completada nesta análise. Use “Completar métricas e análise tática” para reprocessar o trecho do vídeo.
+                O sistema está completando automaticamente a fase ofensiva a partir do trecho do vídeo.
               </div>
             )}
             <div className="grid md:grid-cols-2 gap-8">`
