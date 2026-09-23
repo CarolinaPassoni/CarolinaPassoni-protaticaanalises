@@ -1,3 +1,6 @@
+import 'dotenv/config';
+import { extractVideoId, teamsFromVideoTitle, parseClipRange } from './src/utils/videoIdentity.js';
+export { extractVideoId };
 import express from 'express';
 import http from 'http';
 import path, { join } from 'path';
@@ -119,7 +122,7 @@ import {
 import Stripe from 'stripe';
 import nodemailer from 'nodemailer';
 
-const app = express();
+export const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
 // Setup upload parser for local video files
@@ -250,20 +253,28 @@ const isTransientGeminiError = (err: any): boolean => {
 
 
 const geminiModelCooldownUntil = new Map<string, number>();
+const geminiModelLastError = new Map<string, any>();
 
-const getGeminiRetryAfterSeconds = (err: any): number => {
+export const getGeminiRetryAfterSeconds = (err: any): number => {
   const message = String(err?.message || err?.cause?.message || err || '');
 
   // Cota diária do Free Tier: não continuar queimando chamadas no mesmo modelo.
   if (/PerDayPerProjectPerModel|GenerateRequestsPerDayPerProjectPerModel/i.test(message)) {
-    const now = new Date();
-    const nextUtcDay = Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate() + 1,
-      0, 1, 0
-    );
-    return Math.max(60, Math.ceil((nextUtcDay - Date.now()) / 1000));
+    // Google resets daily quotas at midnight Pacific, including DST.
+    const now = Date.now();
+    const partsAt = (stamp: number) => Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).formatToParts(stamp).map(p => [p.type, p.value]));
+    const today = partsAt(now);
+    const nextLocalDay = Date.UTC(+today.year, +today.month - 1, +today.day + 1);
+    let reset = nextLocalDay + 8 * 3600000;
+    for (let i = 0; i < 2; i++) {
+      const local = partsAt(reset);
+      const displayed = Date.UTC(+local.year, +local.month - 1, +local.day, +local.hour, +local.minute, +local.second);
+      reset += nextLocalDay - displayed;
+    }
+    return Math.max(60, Math.ceil((reset + 60000 - now) / 1000));
   }
 
   const retryInfo =
@@ -284,6 +295,7 @@ const getGeminiRetryAfterSeconds = (err: any): number => {
 const setGeminiModelCooldown = (model: string, err: any) => {
   const seconds = getGeminiRetryAfterSeconds(err);
   geminiModelCooldownUntil.set(model, Date.now() + seconds * 1000);
+  geminiModelLastError.set(model, err);
   console.warn(
     `[GEMINI_COOLDOWN] model=${model} seconds=${seconds} code=${getGeminiErrorCode(err) || 'unknown'}`
   );
@@ -298,7 +310,7 @@ const getGeminiNextRetrySeconds = (): number => {
   return waits.length ? Math.max(5, Math.min(...waits)) : 45;
 };
 
-const generateGeminiResilient = async (
+export const generateGeminiResilient = async (
   ai: GoogleGenAI,
   request: any,
   label: string
@@ -315,6 +327,7 @@ const generateGeminiResilient = async (
     for (const model of modelPlan) {
       const cooldownUntil = geminiModelCooldownUntil.get(model) || 0;
       if (cooldownUntil > Date.now()) {
+        lastError = geminiModelLastError.get(model) || lastError;
         const remaining = Math.ceil((cooldownUntil - Date.now()) / 1000);
         console.warn(
           `[GEMINI_COOLDOWN] skip model=${model} remaining=${remaining}s label=${label}`
@@ -645,58 +658,19 @@ REGRAS:
 12. Retorne apenas o JSON do schema solicitado.
 `;
 
-  const models = getGeminiFailoverPlan(GEMINI_MODEL);
-
-  let lastError: any = null;
-
-  for (const model of models) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: [
-          {
-            fileData: {
-              fileUri: videoUrl,
-              mimeType: 'video/*',
-            },
-            videoMetadata: {
-              startOffset: `${Math.floor(startSec)}s`,
-              endOffset: `${Math.floor(endSec)}s`,
-              fps,
-            },
-          },
-          { text: prompt },
-        ],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: SEGMENT_METRICS_SCHEMA,
-          maxOutputTokens: 4096,
-        },
-      });
-
-      const text = String((response as any)?.text || '').trim();
-      if (!text) throw new Error('Gemini não retornou métricas.');
-
-      const parsed = JSON.parse(text);
-      return { data: parsed, modelUsed: model };
-    } catch (err: any) {
-      lastError = err;
-      const code = getGeminiErrorCode(err);
-      const message = String(err?.message || err);
-
-      console.warn(
-        `[SEGMENT_METRICS] model=${model} success=false code=${code || 'unknown'} error=${message.slice(0, 220)}`
-      );
-
-      // 429/503/timeout: passa imediatamente para o próximo modelo.
-      if (isTransientGeminiError(err)) continue;
-
-      // Se um modelo específico não suportar a configuração, tenta o próximo.
-      if (/unsupported|not supported|model.*not found|invalid model|not available|no longer available|not_found|\b404\b/i.test(message)) continue;
-    }
-  }
-
-  throw lastError || new Error('Não foi possível calcular as métricas do trecho.');
+  const { response, modelUsed } = await generateGeminiResilient(ai, {
+    model: GEMINI_MODEL,
+    contents: [
+      { fileData: { fileUri: videoUrl, mimeType: 'video/*' }, videoMetadata: {
+        startOffset: `${Math.floor(startSec)}s`, endOffset: `${Math.floor(endSec)}s`, fps,
+      } },
+      { text: prompt },
+    ],
+    config: { responseMimeType: 'application/json', responseSchema: SEGMENT_METRICS_SCHEMA, maxOutputTokens: 8192 },
+  }, 'segment-metrics');
+  const data = parseJsonResponse(String(response?.text || ''));
+  if (!data) throw new Error('Gemini não retornou métricas em JSON válido.');
+  return { data, modelUsed };
 };
 
 const cleanTacticalSupplementText = (value: any): string | undefined => {
@@ -912,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.15' });
 });
 
 console.log(
@@ -1091,60 +1065,6 @@ const requirePlanAtLeast = (minimum: 'scout' | 'performance' | 'intelligence') =
 };
 
 // --- UTILS ---
-export const extractVideoId = (rawUrl: string): string | null => {
-  if (!rawUrl || typeof rawUrl !== 'string') return null;
-  const str = rawUrl.trim();
-  if (!str) return null;
-
-  try {
-    const safeUrl = /^https?:\/\//i.test(str) ? str : `https://${str}`;
-    const u = new URL(safeUrl);
-
-    // 1. Check search parameter 'v' (e.g. youtube.com/watch?v=ID)
-    const vParam = u.searchParams.get('v');
-    if (vParam) {
-      const cleanV = vParam.split(/[?&#]/)[0].trim();
-      if (/^[a-zA-Z0-9_-]{11}$/.test(cleanV)) return cleanV;
-    }
-
-    // 2. Check youtu.be shortlinks (e.g. youtu.be/ID)
-    if (u.hostname.toLowerCase().includes('youtu.be')) {
-      const pathSeg = u.pathname.split('/').filter(Boolean)[0];
-      if (pathSeg) {
-        const cleanSeg = pathSeg.split(/[?&#]/)[0].trim();
-        if (/^[a-zA-Z0-9_-]{11}$/.test(cleanSeg)) return cleanSeg;
-      }
-    }
-
-    // 3. Check segments like /shorts/ID, /embed/ID, /live/ID, /v/ID
-    const parts = u.pathname.split('/').filter(Boolean);
-    const pickAfter = (segment: string) => {
-      const idx = parts.findIndex((p) => p.toLowerCase() === segment.toLowerCase());
-      if (idx >= 0 && parts[idx + 1]) {
-        return parts[idx + 1].split(/[?&#]/)[0].trim();
-      }
-      return null;
-    };
-
-    const pathId = pickAfter('shorts') || pickAfter('embed') || pickAfter('live') || pickAfter('v');
-    if (pathId && /^[a-zA-Z0-9_-]{11}$/.test(pathId)) {
-      return pathId;
-    }
-
-    // 4. If direct 11-char ID
-    if (/^[a-zA-Z0-9_-]{11}$/.test(str)) {
-      return str;
-    }
-  } catch {
-    const directMatch = str.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
-    if (directMatch && directMatch[1]) {
-      return directMatch[1];
-    }
-  }
-
-  return null;
-};
-
 export interface VerifiedVideoContext {
   sourceUrl: string;
   videoId: string;
@@ -1162,7 +1082,7 @@ export const fetchYouTubeVideoMetadata = async (rawUrl: string, videoId: string)
 
   try {
     const endpoint = `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(canonicalUrl)}`;
-    const r = await fetch(endpoint);
+    const r = await fetch(endpoint, { signal: AbortSignal.timeout(8000) });
     if (r.ok) {
       const data = await r.json();
       if (data?.title) title = String(data.title).trim();
@@ -1175,6 +1095,7 @@ export const fetchYouTubeVideoMetadata = async (rawUrl: string, videoId: string)
   if (!title || !channelTitle) {
     try {
       const pageRes = await fetch(canonicalUrl, {
+        signal: AbortSignal.timeout(8000),
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
       });
       if (pageRes.ok) {
@@ -1215,7 +1136,7 @@ export const verifyVideoIdentity = async (rawUrl: string): Promise<VerifiedVideo
 
   const meta = await fetchYouTubeVideoMetadata(cleanUrl, videoId);
   return {
-    sourceUrl: cleanUrl,
+    sourceUrl: meta.canonicalUrl,
     videoId: meta.videoId,
     title: meta.title,
     channelTitle: meta.channelTitle,
@@ -2128,7 +2049,7 @@ app.post('/api/telegram/config', requireAdmin, (req, res) => {
 
     res.json({ ok: true, config: getTelegramConfig() });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar configurações do Telegram.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar configurações do Telegram.' });
   }
 });
 
@@ -2943,9 +2864,9 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
 
     const event = stripe.webhooks.constructEvent(req.rawBody, signature, webhookSecret);
 
-    if (event.type === 'checkout.session.completed') {
+    if ((event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded')) {
       const session: any = event.data.object;
-      if (session.payment_status === 'paid' || session.status === 'complete') {
+      if (session.payment_status === 'paid') {
         const sessionKey = `processed_session_${session.id}`;
         if (getSetting(sessionKey) !== 'true') {
           const email = session.customer_details?.email || session.customer_email || session.metadata?.userEmail;
@@ -2984,7 +2905,7 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
       if (invoice.billing_reason === 'subscription_create') {
         return res.json({ received: true });
       }
-      const subscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+      const subscriptionId = typeof (invoice.subscription || invoice.parent?.subscription_details?.subscription) === 'string' ? (invoice.subscription || invoice.parent?.subscription_details?.subscription) : invoice.subscription?.id || invoice.parent?.subscription_details?.subscription?.id;
       if (subscriptionId) {
         const subscription: any = await stripe.subscriptions.retrieve(subscriptionId);
         const plan = getOfficialPlanById(subscription.metadata?.planId || '');
@@ -3160,6 +3081,7 @@ app.post(
   '/api/analyses/:id/recalculate-metrics',
   requireAuth,
   requireActiveSubscription,
+  requireAvailableVideoSlot,
   requirePlanAtLeast('intelligence'),
   async (req, res) => {
     const user = (req as any).user;
@@ -3232,10 +3154,12 @@ app.post(
     } catch (err: any) {
       console.error('[SEGMENT_METRICS] Falha:', err);
 
-      return res.status(502).json({
-        error:
-          'Não foi possível recalcular as métricas do vídeo agora. Tente novamente em alguns minutos.',
-      });
+      const status = getGeminiErrorCode(err) === 429 ? 429 : 503;
+      const retryAfterSeconds = err.retryAfterSeconds || getGeminiRetryAfterSeconds(err);
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      return res.status(status).json({ error: status === 429
+        ? 'A cota do Gemini foi atingida. As métricas salvas foram preservadas. Verifique a cota no Google AI Studio.'
+        : 'Gemini indisponível no momento. As métricas salvas foram preservadas.', retryAfterSeconds });
     }
   }
 );
@@ -3430,8 +3354,21 @@ const canonicalScore = (value: any): string | null => {
   return match ? `${Number(match[1])} x ${Number(match[2])}` : null;
 };
 
+const activeVideoJobs = new Set<string>();
+function requireAvailableVideoSlot(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const userId = (req as any).user.id;
+  if (activeVideoJobs.has(userId)) return res.status(409).json({ error: 'Já existe uma análise em andamento para sua conta. Aguarde a conclusão.', code: 'ANALYSIS_IN_PROGRESS' });
+  activeVideoJobs.add(userId);
+  res.once('finish', () => activeVideoJobs.delete(userId));
+  next();
+};
+
 // --- REAL VIDEO & MULTIMODAL ANALYSIS PIPELINE ---
-app.post('/api/analyze', requireAuth, requireActiveSubscription, upload.single('videoFile'), async (req, res) => {
+app.post('/api/analyze', requireAuth, requireActiveSubscription, requireAvailableVideoSlot, upload.single('videoFile'), async (req, res) => {
+  if (req.file?.path) {
+    const uploadedPath = req.file.path;
+    res.once('finish', () => { try { rmSync(uploadedPath, { force: true }); } catch {} });
+  }
   // Logs de requisição de análise
   const user = (req as any).user || getAuthUser(req);
   if (!enforceRateLimit(req, res, `analyze:${user?.id || 'anonymous'}`, 20, 60 * 60)) return;
@@ -3458,8 +3395,9 @@ app.post('/api/analyze', requireAuth, requireActiveSubscription, upload.single('
 
   if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY não configurada.' });
 
-  const startSec = Math.max(0, parseInt(clipStartSeconds || '0', 10));
-  const endSec = Math.max(startSec + 30, parseInt(clipEndSeconds || '900', 10));
+  let startSec: number, endSec: number;
+  try { ({ startSec, endSec } = parseClipRange(clipStartSeconds, clipEndSeconds)); }
+  catch (error: any) { return res.status(400).json({ error: error.message }); }
   const analysisMode = (mode === 'complete' || mode === 'detailed') ? mode : 'quick';
 
   let verifiedContext: VerifiedVideoContext;
@@ -3641,10 +3579,10 @@ DIRETRIZES:
     let timeA = String(searchData?.timeA || '').trim();
     let timeB = String(searchData?.timeB || '').trim();
     if (!timeA || !timeB) {
-      const vsMatch = verifiedContext.title.match(/(.+?)\s+(?:x|X|vs\.?|contra|-)\s+(.+?)(?:\||-|–|—|\(|\d{1,2}[\/\.]\d{1,2}|$)/i);
-      if (vsMatch && vsMatch[1] && vsMatch[2]) {
-        timeA = timeA || vsMatch[1].replace(/^(assista|ao vivo|melhores momentos|jogo completo|gols|resumo|transmissão de|highlights)\s*[:\-–—]?\s*/i, '').trim();
-        timeB = timeB || vsMatch[2].replace(/\s*(gols|melhores momentos|resumo|jogo completo|ao vivo|highlights).*$/i, '').trim();
+      const titleTeams = teamsFromVideoTitle(verifiedContext.title);
+      if (titleTeams) {
+        timeA = timeA || titleTeams.timeA;
+        timeB = timeB || titleTeams.timeB;
       }
     }
     timeA = timeA || 'Time A';
@@ -3930,13 +3868,22 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     // Somente depois do portão de identidade os nomes canônicos do título/metadado
     // podem ser usados para padronizar a apresentação.
-    parsed.timeA = timeA;
-    parsed.timeB = timeB;
+    // Preserve the AI's order: all per-team statistics follow that order,
+    // including when the video presents the fixture in reverse.
+    const expectedTeams = [timeA, timeB];
+    parsed.timeA = !isGenericIdentityTeam(aiReportedTimeA) ? aiReportedTimeA : timeA;
+    parsed.timeB = !isGenericIdentityTeam(aiReportedTimeB) ? aiReportedTimeB : timeB;
+    timeA = parsed.timeA;
+    timeB = parsed.timeB;
+    if (!visualIdentityConfirmed || !expectedIdentityIsStrict) {
+      validationStatus = 'partial';
+      sectionValidation.matchIdentity = 'partial';
+    }
 
     if (!parsed.verificacaoAuditoria) parsed.verificacaoAuditoria = {};
     parsed.verificacaoAuditoria.identityAudit = {
-      expectedTimeA: timeA,
-      expectedTimeB: timeB,
+      expectedTimeA: expectedTeams[0],
+      expectedTimeB: expectedTeams[1],
       observedTimeA: observedIdentityA,
       observedTimeB: observedIdentityB,
       visuallyConfirmed: visualIdentityConfirmed,
@@ -3949,7 +3896,7 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     if (useNativeYouTubeVideo) {
       parsed.verificacaoAuditoria.metricasOrigem = 'estimativa_visual_trecho';
       parsed.verificacaoAuditoria.metricasTrecho = `${startSec}s - ${endSec}s`;
-      parsed.verificacaoAuditoria.metricasModelo = GEMINI_MODEL;
+      parsed.verificacaoAuditoria.metricasModelo = analysisModelUsed;
       parsed.verificacaoAuditoria.metricasObservacoes =
         'Posse, ocupação por terços e xG são estimativas visuais do trecho; contagens representam eventos observados no trecho, não estatísticas oficiais da partida completa.';
     }
@@ -3978,12 +3925,12 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     );
 
     const heatmapComplete = Boolean(
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio &&
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo)
     );
 
     const defensiveComplete = Boolean(
@@ -4008,6 +3955,7 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     // métricas. Um segundo passe só é permitido quando algo realmente faltou;
     // isso evita duplicar consumo de cota e gerar 429 desnecessariamente.
     const needsTacticalCompletion = Boolean(
+      process.env.GEMINI_ENABLE_TACTICAL_COMPLETION === 'true' &&
       useNativeYouTubeVideo &&
       (!possessionComplete || !finishingComplete || !heatmapComplete ||
         !defensiveComplete || !offensiveComplete)
@@ -4052,22 +4000,21 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
       metricPairComplete(parsed?.estatisticas?.finalizacoesNoAlvo) &&
       metricPairComplete(parsed?.indicadoresAvancados?.xG) &&
       metricPairComplete(parsed?.indicadoresAvancados?.grandesChances) &&
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio &&
-      parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio &&
-      parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio) &&
+      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo)
     );
 
     if (!finalCoreMetricsComplete) {
-      const metricsError: any = new Error(
-        'A IA não conseguiu concluir as métricas obrigatórias deste trecho. O relatório incompleto não foi salvo. Escolha um trecho com jogo ativo ou aguarde a liberação da cota da IA.'
-      );
-      metricsError.code = 'INCOMPLETE_VIDEO_METRICS';
-      metricsError.status = 422;
-      metricsError.retryable = false;
-      throw metricsError;
+      // Missing estimates must not erase the observable tactical report.
+      validationStatus = 'partial';
+      sectionValidation.statistics = 'partial';
+      parsed.verificacaoAuditoria.metricasIncompletas = true;
+      parsed.verificacaoAuditoria.metricasObservacoes =
+        'Métricas não observadas permanecem indisponíveis. Relatório parcial; valores ausentes não são zero.';
     }
 
     if (!parsed.contextoPartida) parsed.contextoPartida = {};
@@ -4181,7 +4128,7 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
       }
     });
 
-    if (expectedIdentityIsStrict && visualIdentityConfirmed && identityMatch.ok) {
+    if (expectedIdentityIsStrict && visualIdentityConfirmed && identityMatch.ok && finalCoreMetricsComplete) {
       normalized.validationStatus = 'verified';
       normalized.sectionValidation.matchIdentity = 'verified';
       if (normalized.verificacaoAuditoria) {
@@ -4244,11 +4191,15 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     if (retryable) {
       const quotaRelated = geminiCode === 429;
+      const dailyQuota = /PerDayPerProjectPerModel/i.test(String(err?.cause?.message || err?.message || ''));
+      res.setHeader('Retry-After', String(err?.retryAfterSeconds || getGeminiRetryAfterSeconds(err)));
       return res.status(quotaRelated ? 429 : 503).json({
-        error: quotaRelated
+        error: dailyQuota
+          ? 'A cota diária do Gemini foi esgotada. Aguarde a renovação da cota ou peça ao administrador para revisar o plano e o faturamento no Google AI Studio.'
+          : quotaRelated
           ? 'O limite temporário de uso da inteligência artificial foi atingido. Aguarde alguns minutos e tente novamente.'
           : 'A inteligência artificial está com alta demanda no momento. O ProTática tentou novamente automaticamente, inclusive com o modelo de contingência. Aguarde alguns minutos e tente novamente.',
-        code: quotaRelated ? 'AI_RATE_LIMITED' : 'AI_TEMPORARILY_UNAVAILABLE',
+        code: dailyQuota ? 'AI_DAILY_QUOTA_EXHAUSTED' : quotaRelated ? 'AI_RATE_LIMITED' : 'AI_TEMPORARILY_UNAVAILABLE',
         retryable: true,
         retryAfterSeconds: Math.max(
           5,
@@ -4259,6 +4210,7 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     res.status(500).json({ error: 'Não foi possível concluir a análise. Verifique o vídeo e tente novamente.' });
   } finally {
+    activeVideoJobs.delete(user.id);
     if (localVideoPath && existsSync(localVideoPath)) {
       try { rmSync(localVideoPath, { force: true }); } catch {}
     }
@@ -4372,7 +4324,7 @@ app.post('/api/tactical/plans', requireAuth, requireActiveSubscription, requireP
     const saved = saveTrainingPlan({ ...plan, userId: user?.id });
     res.json({ plan: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar plano de treino.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar plano de treino.' });
   }
 });
 
@@ -4407,7 +4359,7 @@ app.post('/api/tactical/boards', requireAuth, requireActiveSubscription, require
     const saved = saveTacticalBoard({ ...board, userId: user?.id });
     res.json({ board: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar quadro tático.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar quadro tático.' });
   }
 });
 
@@ -4443,7 +4395,7 @@ app.post('/api/tactical/evidences', requireAuth, requireActiveSubscription, requ
     const saved = saveEvidenceItem({ ...evidence, userId: user?.id });
     res.json({ evidence: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar evidência.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar evidência.' });
   }
 });
 
@@ -4478,7 +4430,7 @@ app.post('/api/tactical/goals', requireAuth, requireActiveSubscription, requireP
     const saved = saveTeamGoal({ ...goal, userId: user?.id });
     res.json({ goal: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar meta.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar meta.' });
   }
 });
 
@@ -4513,7 +4465,7 @@ app.post('/api/tactical/teams', requireAuth, (req, res) => {
     const saved = saveTeam({ ...team, userId: user?.id });
     res.json({ team: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar equipe.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar equipe.' });
   }
 });
 
@@ -4548,7 +4500,7 @@ app.post('/api/tactical/dossiers', requireAuth, requireActiveSubscription, requi
     const saved = saveOpponentDossier({ ...dossier, userId: user?.id });
     res.json({ dossier: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar dossiê.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar dossiê.' });
   }
 });
 
@@ -4712,7 +4664,7 @@ app.post('/api/competitions', requireAdmin, (req, res) => {
     const saved = saveCompetition(req.body);
     res.json({ competition: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar competição.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar competição.' });
   }
 });
 
@@ -4931,7 +4883,7 @@ app.post('/api/matches', requireAdmin, (req, res) => {
     const saved = saveMatch(req.body);
     res.json({ match: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar partida.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar partida.' });
   }
 });
 
@@ -4995,7 +4947,7 @@ app.post('/api/players/catalog', requireAdmin, (req, res) => {
     const saved = savePlayerCatalogEntry(req.body);
     res.json({ player: saved });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Erro ao salvar jogador no catálogo.' });
+    res.status(err.status || 500).json({ error: err.message || 'Erro ao salvar jogador no catálogo.' });
   }
 });
 
@@ -5034,6 +4986,16 @@ app.post('/api/analyses/:id/visibility', requireAdmin, (req, res) => {
 });
 
 
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Endpoint não encontrado.' }));
+app.use((error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(error);
+  const status = error instanceof multer.MulterError ? (error.code === 'LIMIT_FILE_SIZE' ? 413 : 400) : Number(error.status || 500);
+  console.error('[HTTP_ERROR]', error.message);
+  res.status(status >= 400 && status <= 599 ? status : 500).json({
+    error: status === 413 ? 'Arquivo excede o limite de 750 MB.' : status < 500 ? 'Requisição inválida.' : 'Erro interno. Tente novamente.',
+  });
+});
+
 // --- VITE AND SERVER BOOTSTRAP ---
 async function startServer() {
   const server = http.createServer(app);
@@ -5063,4 +5025,4 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') startServer().catch((error) => { console.error('[BOOT]', error); process.exitCode = 1; });

@@ -46,7 +46,7 @@ export async function verifyAuthSession(): Promise<any | null> {
 export async function verifyVideo(url: string): Promise<VerifiedVideoContext> {
   const response = await fetch('/api/verify-video', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ url }),
   });
 

@@ -1,7 +1,7 @@
 {
   "name": "react-example",
   "private": true,
-  "version": "6.10.14",
+  "version": "6.10.15",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -9,7 +9,8 @@
     "start": "node scripts/start-protatica.cjs",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/tests/audit_suite.test.ts"
+    "test": "node scripts/run-tests.cjs",
+    "test:integration": "node scripts/run-tests.cjs --network"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

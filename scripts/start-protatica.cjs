@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { spawn, spawnSync } = require('node:child_process');
 const path = require('node:path');
 
@@ -18,7 +19,8 @@ const runBlocking = (script) => {
   }
 };
 
-runBlocking('scripts/validate-match-integrity.cjs');
+// Cleanup of historic/demo rows is an explicit maintenance operation.
+// Startup must never delete application data implicitly.
 
 const server = spawn(process.execPath, [path.join(process.cwd(), 'dist/server.cjs')], {
   stdio: 'inherit',
@@ -81,9 +83,9 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.on('exit', (code, signal) => {
-  if (signal) {
-    try { process.kill(process.pid, signal); } catch {}
-    return;
-  }
+  if (activeSync && !activeSync.killed) activeSync.kill('SIGTERM');
+  if (signal) process.exit(signal === 'SIGTERM' ? 143 : 130);
   process.exit(code ?? 0);
 });
+
+server.on('error', (error) => { console.error('[BOOT]', error.message); process.exit(1); });

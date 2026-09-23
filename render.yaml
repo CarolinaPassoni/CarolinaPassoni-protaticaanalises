@@ -4,7 +4,7 @@ services:
     runtime: node
     region: virginia
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
@@ -56,4 +56,8 @@ services:
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
       - key: TELEGRAM_DATA_USER_ID
+        sync: false
+      - key: GEMINI_ENABLE_TACTICAL_COMPLETION
+        value: "false"
+      - key: API_FOOTBALL_KEY
         sync: false

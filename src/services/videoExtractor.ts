@@ -1,4 +1,8 @@
-import { execSync } from 'node:child_process';
+import { extractVideoId } from '../utils/videoIdentity.js';
+export { extractVideoId };
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const runFfmpeg = promisify(execFile);
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -44,60 +48,6 @@ export const formatSecondsToTimestamp = (seconds: number): string => {
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   }
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-};
-
-export const extractVideoId = (rawUrl: string): string | null => {
-  if (!rawUrl || typeof rawUrl !== 'string') return null;
-  const str = rawUrl.trim();
-  if (!str) return null;
-
-  try {
-    const safeUrl = /^https?:\/\//i.test(str) ? str : `https://${str}`;
-    const u = new URL(safeUrl);
-
-    // 1. Check search parameter 'v' (e.g. youtube.com/watch?v=ID)
-    const vParam = u.searchParams.get('v');
-    if (vParam) {
-      const cleanV = vParam.split(/[?&#]/)[0].trim();
-      if (/^[a-zA-Z0-9_-]{11}$/.test(cleanV)) return cleanV;
-    }
-
-    // 2. Check youtu.be shortlinks (e.g. youtu.be/ID)
-    if (u.hostname.toLowerCase().includes('youtu.be')) {
-      const pathSeg = u.pathname.split('/').filter(Boolean)[0];
-      if (pathSeg) {
-        const cleanSeg = pathSeg.split(/[?&#]/)[0].trim();
-        if (/^[a-zA-Z0-9_-]{11}$/.test(cleanSeg)) return cleanSeg;
-      }
-    }
-
-    // 3. Check segments like /shorts/ID, /embed/ID, /live/ID, /v/ID
-    const parts = u.pathname.split('/').filter(Boolean);
-    const pickAfter = (segment: string) => {
-      const idx = parts.findIndex((p) => p.toLowerCase() === segment.toLowerCase());
-      if (idx >= 0 && parts[idx + 1]) {
-        return parts[idx + 1].split(/[?&#]/)[0].trim();
-      }
-      return null;
-    };
-
-    const pathId = pickAfter('shorts') || pickAfter('embed') || pickAfter('live') || pickAfter('v');
-    if (pathId && /^[a-zA-Z0-9_-]{11}$/.test(pathId)) {
-      return pathId;
-    }
-
-    // 4. If direct 11-char ID
-    if (/^[a-zA-Z0-9_-]{11}$/.test(str)) {
-      return str;
-    }
-  } catch {
-    const directMatch = str.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
-    if (directMatch && directMatch[1]) {
-      return directMatch[1];
-    }
-  }
-
-  return null;
 };
 
 /**
@@ -256,13 +206,13 @@ export const fetchYouTubeTranscript = async (
 /**
  * Extrai frames representativos com ffmpeg a partir de um arquivo local
  */
-export const extractFramesFromLocalVideo = (
+export const extractFramesFromLocalVideo = async (
   videoFilePath: string,
   clipStartSeconds: number,
   clipEndSeconds: number,
   targetFrameCount: number,
   analysisId?: string
-): ExtractedFrame[] => {
+): Promise<ExtractedFrame[]> => {
   const frames: ExtractedFrame[] = [];
   const tempDir = join('/tmp', 'protatica', analysisId || randomUUID());
 
@@ -276,9 +226,7 @@ export const extractFramesFromLocalVideo = (
       const sec = clipStartSeconds + (i * step);
       const outPath = join(tempDir, `frame_${i.toString().padStart(3, '0')}.jpg`);
       try {
-        execSync(`ffmpeg -ss ${sec.toFixed(2)} -i "${videoFilePath}" -frames:v 1 -q:v 3 -vf "scale='min(854,iw)':-1" "${outPath}" -y -loglevel error`, {
-          timeout: 10000
-        });
+        await runFfmpeg(process.env.FFMPEG_PATH || 'ffmpeg', ['-ss', sec.toFixed(2), '-i', videoFilePath, '-frames:v', '1', '-q:v', '3', '-vf', "scale='min(854,iw)':-1", outPath, '-y', '-loglevel', 'error'], { timeout: 10000 });
 
         if (existsSync(outPath)) {
           const buf = readFileSync(outPath);
@@ -481,9 +429,7 @@ export async function extractFramesFromYouTubeVideo(
       if (sheetPath && existsSync(sheetPath)) {
         const framePath = join(tempDir, `frame_${(idx + 1).toString().padStart(3, '0')}.jpg`);
         try {
-          execSync(`ffmpeg -i "${sheetPath}" -vf "crop=${bestLevel.width}:${bestLevel.height}:${x}:${y}" "${framePath}" -y -loglevel error`, {
-            timeout: 10000,
-          });
+          await runFfmpeg(process.env.FFMPEG_PATH || 'ffmpeg', ['-i', sheetPath, '-vf', `crop=${bestLevel.width}:${bestLevel.height}:${x}:${y}`, framePath, '-y', '-loglevel', 'error'], { timeout: 10000 });
 
           if (existsSync(framePath)) {
             const fBuf = readFileSync(framePath);
@@ -586,7 +532,7 @@ export const processMultimodalVideoEvidence = async (
   if (localFilePath && existsSync(localFilePath)) {
     logs.push(`[VIDEO_SOURCE] Arquivo Local`);
     logs.push(`[FRAMES] Extraindo ${targetFrameCount} frames reais de arquivo local com ffmpeg...`);
-    frames = extractFramesFromLocalVideo(localFilePath, clipStartSeconds, clipEndSeconds, targetFrameCount, currentAnalysisId);
+    frames = await extractFramesFromLocalVideo(localFilePath, clipStartSeconds, clipEndSeconds, targetFrameCount, currentAnalysisId);
     hasRealVideoFrames = frames.length > 0;
     logs.push(`[FRAMES] ${frames.length} frames extraídos com sucesso.`);
   } else if (videoId) {

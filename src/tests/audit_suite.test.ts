@@ -144,7 +144,7 @@ test('8. Integridade do Relatório PDF Centralizado', async () => {
   assert.equal(pdf.buffer.subarray(0, 4).toString('ascii'), '%PDF', 'O arquivo deve conter o cabeçalho PDF válido');
 });
 
-test('9. Extração de Frames Reais do YouTube e Regras de Validação', async () => {
+test('9. Extração de Frames Reais do YouTube e Regras de Validação', { skip: process.env.RUN_NETWORK_TESTS !== 'true' }, async () => {
   const { processMultimodalVideoEvidence } = await import('../services/videoExtractor.js');
 
   // Teste 1: URL real do YouTube com storyboard disponível (extrai frames reais)
@@ -211,7 +211,7 @@ test('9. Extração de Frames Reais do YouTube e Regras de Validação', async (
   assert.equal(sectionValidation.heatmap, 'unverified', 'Sem frames reais, heatmap deve ser unverified');
 });
 
-test('10. Variabilidade de Trechos e Amostragem Temporal de Vídeo', async () => {
+test('10. Variabilidade de Trechos e Amostragem Temporal de Vídeo', { skip: process.env.RUN_NETWORK_TESTS !== 'true' }, async () => {
   const { processMultimodalVideoEvidence } = await import('../services/videoExtractor.js');
 
   // Trecho 1: 00:00 - 05:00 (0 a 300s)

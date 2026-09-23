@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
@@ -15,6 +16,7 @@ if (production && (!tursoUrl || !tursoAuthToken)) {
 }
 
 let database: any;
+let transactionActive = false;
 
 const createDatabaseConnection = () => {
   if (usingRemoteDatabase) {
@@ -50,7 +52,9 @@ const isExpiredRemoteStream = (error: any) =>
   );
 
 const reconnectRemoteDatabase = () => {
+  try { database.close(); } catch {}
   database = createDatabaseConnection();
+  database.exec('PRAGMA foreign_keys = ON;');
   console.warn('[DB] Conexão Turso renovada automaticamente.');
 };
 
@@ -58,7 +62,7 @@ const runWithReconnect = <T>(operation: () => T): T => {
   try {
     return operation();
   } catch (error) {
-    if (!isExpiredRemoteStream(error)) throw error;
+    if (transactionActive || !isExpiredRemoteStream(error)) throw error;
     reconnectRemoteDatabase();
     return operation();
   }
@@ -68,6 +72,12 @@ const runWithReconnect = <T>(operation: () => T): T => {
 // uma instância ociosa; cada statement é preparado na conexão atual e repetido
 // uma vez após reconexão, sem exigir recarregar a página ou reiniciar o Render.
 export const db: any = {
+  transaction<T>(operation: () => T): T {
+    if (transactionActive) return operation();
+    transactionActive = true;
+    try { return database.transaction(operation).immediate(); }
+    finally { transactionActive = false; }
+  },
   exec(sql: string) {
     return runWithReconnect(() => database.exec(sql));
   },
@@ -861,7 +871,7 @@ const syncDatabaseSchema = () => {
   // Seed player catalog initial entries with verified identity
   try {
     const pCount: any = db.prepare('SELECT COUNT(*) as count FROM player_catalog').get();
-    if (pCount?.count === 0) {
+    if (!production && pCount?.count === 0) {
       const initialCatalog = [
         {
           id: 'p_pedro_fla',
@@ -1256,7 +1266,7 @@ export const verifyAuthSessionToken = (token: string) => {
       }
     }
 
-    if (!row) return null;
+    if (!row || Number(row.is_blocked)) return null;
     return {
       id: row.id,
       username: row.username,
@@ -1419,7 +1429,7 @@ export const deletePlayerPhotoCache = (nomeNormalizado: string, time?: string) =
 };
 
 // --- ANALYSIS PERSISTENCE ---
-export const saveAnalysis = (analysis: any, userId?: string) => {
+export const saveAnalysis = (analysis: any, userId?: string) => db.transaction(() => {
   const id = analysis.analysisId || randomUUID();
   const createdAt = analysis.createdAt || new Date().toISOString();
   let confidenceVal = (analysis.verificacaoAuditoria?.nivelConfianca || analysis.placarAuditoria?.confianca || '').trim().toLowerCase();
@@ -1435,9 +1445,19 @@ export const saveAnalysis = (analysis: any, userId?: string) => {
   }
 
   db.prepare(`
-    INSERT OR REPLACE INTO analyses (
+    INSERT INTO analyses (
       id, created_at, video_title, video_url, video_id, team_a, team_b, placar, confidence, strategy, payload_json, user_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      video_title = excluded.video_title,
+      video_url = excluded.video_url,
+      video_id = excluded.video_id,
+      team_a = excluded.team_a,
+      team_b = excluded.team_b,
+      placar = excluded.placar,
+      confidence = excluded.confidence,
+      strategy = excluded.strategy,
+      payload_json = excluded.payload_json
   `).run(
     id,
     createdAt,
@@ -1489,7 +1509,7 @@ export const saveAnalysis = (analysis: any, userId?: string) => {
   }
 
   return { id, createdAt };
-};
+});
 
 export const listAnalyses = (limit = 20, userId?: string) => {
   const maxLimit = Math.max(1, Math.min(limit, 100));
@@ -2178,6 +2198,16 @@ export const listEmailLogs = (limit = 100) => {
   }
 };
 
+const assertOwnedWrite = (table: string, id: string, userId?: string, analysisId?: string) => {
+  const existing = db.prepare(`SELECT user_id FROM ${table} WHERE id = ?`).get(id);
+  if (existing && existing.user_id !== (userId || null)) {
+    throw Object.assign(new Error('Registro pertence a outra conta.'), { status: 403 });
+  }
+  if (analysisId && !getAnalysisById(analysisId, userId)) {
+    throw Object.assign(new Error('Análise vinculada não encontrada nesta conta.'), { status: 404 });
+  }
+};
+
 // --- TRAINING PLANS REPOSITORY ---
 export const saveTrainingPlan = (plan: {
   id?: string;
@@ -2198,14 +2228,32 @@ export const saveTrainingPlan = (plan: {
   nextMatchIndicators: string[];
 }) => {
   const planId = plan.id || randomUUID();
+  assertOwnedWrite('training_plans', planId, plan.userId, plan.analysisId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO training_plans (
+    INSERT INTO training_plans (
       id, user_id, analysis_id, title, problem_identified, objective, duration,
       players_count, materials, organization, execution, expected_behaviors_json,
       observation_points_json, progression, regression, next_match_indicators_json,
       created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      analysis_id = excluded.analysis_id,
+      title = excluded.title,
+      problem_identified = excluded.problem_identified,
+      objective = excluded.objective,
+      duration = excluded.duration,
+      players_count = excluded.players_count,
+      materials = excluded.materials,
+      organization = excluded.organization,
+      execution = excluded.execution,
+      expected_behaviors_json = excluded.expected_behaviors_json,
+      observation_points_json = excluded.observation_points_json,
+      progression = excluded.progression,
+      regression = excluded.regression,
+      next_match_indicators_json = excluded.next_match_indicators_json,
+      updated_at = excluded.updated_at
+    WHERE training_plans.user_id IS excluded.user_id
   `).run(
     planId,
     plan.userId || null,
@@ -2295,11 +2343,20 @@ export const saveTacticalBoard = (board: {
   previewImage?: string;
 }) => {
   const boardId = board.id || randomUUID();
+  assertOwnedWrite('tactical_boards', boardId, board.userId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO tactical_boards (
+    INSERT INTO tactical_boards (
       id, user_id, title, formation_a, formation_b, payload_json, preview_image, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      title = excluded.title,
+      formation_a = excluded.formation_a,
+      formation_b = excluded.formation_b,
+      payload_json = excluded.payload_json,
+      preview_image = excluded.preview_image,
+      updated_at = excluded.updated_at
+    WHERE tactical_boards.user_id IS excluded.user_id
   `).run(
     boardId,
     board.userId || null,
@@ -2376,12 +2433,25 @@ export const saveEvidenceItem = (evidence: {
   videoUrl?: string;
 }) => {
   const evidenceId = evidence.id || randomUUID();
+  assertOwnedWrite('saved_evidences', evidenceId, evidence.userId, evidence.analysisId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO saved_evidences (
+    INSERT INTO saved_evidences (
       id, user_id, analysis_id, category, title, timestamp, description,
       team, player, source, confidence, video_url, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      analysis_id = excluded.analysis_id,
+      category = excluded.category,
+      title = excluded.title,
+      timestamp = excluded.timestamp,
+      description = excluded.description,
+      team = excluded.team,
+      player = excluded.player,
+      source = excluded.source,
+      confidence = excluded.confidence,
+      video_url = excluded.video_url
+    WHERE saved_evidences.user_id IS excluded.user_id
   `).run(
     evidenceId,
     evidence.userId || null,
@@ -2461,12 +2531,22 @@ export const saveTeamGoal = (goal: {
   achieved?: boolean;
 }) => {
   const goalId = goal.id || randomUUID();
+  assertOwnedWrite('team_goals', goalId, goal.userId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO team_goals (
+    INSERT INTO team_goals (
       id, user_id, title, target_behavior, current_status, progress_notes_json,
       target_period, achieved, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      title = excluded.title,
+      target_behavior = excluded.target_behavior,
+      current_status = excluded.current_status,
+      progress_notes_json = excluded.progress_notes_json,
+      target_period = excluded.target_period,
+      achieved = excluded.achieved,
+      updated_at = excluded.updated_at
+    WHERE team_goals.user_id IS excluded.user_id
   `).run(
     goalId,
     goal.userId || null,
@@ -2540,11 +2620,20 @@ export const saveTeam = (team: {
   shieldUrl?: string;
 }) => {
   const teamId = team.id || randomUUID();
+  assertOwnedWrite('teams', teamId, team.userId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO teams (
+    INSERT INTO teams (
       id, user_id, name, category, season, city, shield_url, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      category = excluded.category,
+      season = excluded.season,
+      city = excluded.city,
+      shield_url = excluded.shield_url,
+      updated_at = excluded.updated_at
+    WHERE teams.user_id IS excluded.user_id
   `).run(
     teamId,
     team.userId || null,
@@ -2615,11 +2704,19 @@ export const saveOpponentDossier = (dossier: {
   payload: any;
 }) => {
   const dossierId = dossier.id || randomUUID();
+  assertOwnedWrite('opponent_dossiers', dossierId, dossier.userId);
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT OR REPLACE INTO opponent_dossiers (
+    INSERT INTO opponent_dossiers (
       id, user_id, opponent_name, analyzed_matches_count, matches_ids_json, payload_json, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      opponent_name = excluded.opponent_name,
+      analyzed_matches_count = excluded.analyzed_matches_count,
+      matches_ids_json = excluded.matches_ids_json,
+      payload_json = excluded.payload_json,
+      updated_at = excluded.updated_at
+    WHERE opponent_dossiers.user_id IS excluded.user_id
   `).run(
     dossierId,
     dossier.userId || null,
@@ -2774,9 +2871,19 @@ export const saveCompetition = (comp: {
   const displayOrder = Number(comp.displayOrder || 0);
 
   db.prepare(`
-    INSERT OR REPLACE INTO competitions (
+    INSERT INTO competitions (
       id, name, slug, country, region, logo_url, season, is_active, display_order, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM competitions WHERE id = ?), ?), ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      slug = excluded.slug,
+      country = excluded.country,
+      region = excluded.region,
+      logo_url = excluded.logo_url,
+      season = excluded.season,
+      is_active = excluded.is_active,
+      display_order = excluded.display_order,
+      updated_at = excluded.updated_at
   `).run(
     id,
     comp.name,
@@ -2963,7 +3070,7 @@ export const saveMatch = (match: {
   const isFeatured = match.isFeatured ? 1 : 0;
 
   db.prepare(`
-    INSERT OR REPLACE INTO matches (
+    INSERT INTO matches (
       id, competition_id, home_team, away_team, home_team_logo, away_team_logo, video_url,
       match_date, round, stadium, status, analysis_id, is_featured,
       featured_player_name, featured_player_photo, featured_player_position, featured_player_team,
@@ -2974,6 +3081,26 @@ export const saveMatch = (match: {
       ?, ?, ?, ?,
       ?, ?, COALESCE((SELECT created_at FROM matches WHERE id = ?), ?), ?
     )
+    ON CONFLICT(id) DO UPDATE SET
+      competition_id = excluded.competition_id,
+      home_team = excluded.home_team,
+      away_team = excluded.away_team,
+      home_team_logo = excluded.home_team_logo,
+      away_team_logo = excluded.away_team_logo,
+      video_url = excluded.video_url,
+      match_date = excluded.match_date,
+      round = excluded.round,
+      stadium = excluded.stadium,
+      status = excluded.status,
+      analysis_id = excluded.analysis_id,
+      is_featured = excluded.is_featured,
+      featured_player_name = excluded.featured_player_name,
+      featured_player_photo = excluded.featured_player_photo,
+      featured_player_position = excluded.featured_player_position,
+      featured_player_team = excluded.featured_player_team,
+      home_score = excluded.home_score,
+      away_score = excluded.away_score,
+      updated_at = excluded.updated_at
   `).run(
     id,
     match.competitionId,
@@ -3146,9 +3273,22 @@ export const savePlayerCatalogEntry = (player: {
   const status = player.status || (isAdminVerified ? 'admin_verified' : (isPhotoVerified ? 'confirmed' : 'unconfirmed'));
 
   db.prepare(`
-    INSERT OR REPLACE INTO player_catalog (
+    INSERT INTO player_catalog (
       id, normalized_name, display_name, club, position, shirt_number, season, photo_url, photo_source, photo_verified, admin_verified, status, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM player_catalog WHERE id = ?), ?), ?)
+    ON CONFLICT(id) DO UPDATE SET
+      normalized_name = excluded.normalized_name,
+      display_name = excluded.display_name,
+      club = excluded.club,
+      position = excluded.position,
+      shirt_number = excluded.shirt_number,
+      season = excluded.season,
+      photo_url = excluded.photo_url,
+      photo_source = excluded.photo_source,
+      photo_verified = excluded.photo_verified,
+      admin_verified = excluded.admin_verified,
+      status = excluded.status,
+      updated_at = excluded.updated_at
   `).run(
     id,
     normalizedName,

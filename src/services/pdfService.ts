@@ -1,5 +1,3 @@
-import { mkdirSync, writeFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import type { Analysis } from '../types.js';
 import { getAnalysisById, enrichAnalysisFromDb } from '../db-sqlite.js';
 import { buildAnalysisPdfDocument, sanitizeFilename, getAnalysisPdfFilename } from '../utils/pdfDocumentBuilder.js';
@@ -38,40 +36,18 @@ export async function generateAnalysisPdf(analysisOrId: Analysis | string): Prom
     console.log('[PDF] analysisId:', analysisId || 'em memória');
   }
 
-  const { doc, filename, buffer, size, base64 } = buildAnalysisPdfDocument(analysis);
+  const { filename, buffer, size, base64 } = buildAnalysisPdfDocument(analysis);
 
   if (!buffer || buffer.length === 0) {
     console.error('[PDF ERROR] Buffer gerado vazio');
     throw new Error('PDF_EMPTY');
   }
 
-  let tempPath: string | undefined;
-
-  try {
-    const safeId = analysisId ? analysisId.replace(/[^a-zA-Z0-9_\-]/g, '_') : 'temp';
-    const tempDir = join('/tmp', 'protatica', safeId);
-    mkdirSync(tempDir, { recursive: true });
-    
-    tempPath = join(tempDir, filename);
-    writeFileSync(tempPath, buffer);
-
-    const stat = statSync(tempPath);
-    if (stat.size === 0) {
-      console.error('[PDF ERROR] Arquivo temporário criado com tamanho 0:', tempPath);
-      throw new Error('PDF_EMPTY_FILE');
-    }
-
-    console.log('[PDF] caminho temporário:', tempPath);
-    console.log('[PDF] tamanho gerado:', stat.size, 'bytes');
-  } catch (fsErr: any) {
-    console.warn('[PDF] Aviso ao gravar arquivo em disco:', fsErr.message);
-  }
 
   return {
     buffer,
     filename,
     size,
-    tempPath,
     base64,
     analysis,
   };

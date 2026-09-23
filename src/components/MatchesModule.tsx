@@ -205,7 +205,7 @@ export const MatchesModule: React.FC<MatchesModuleProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {filteredMatches.map((match) => {
             const hasAnalysis = Boolean(match.analysisId);
-            const canAnalyze = Boolean(match.videoUrl) || match.status === 'finished';
+            const canAnalyze = Boolean(match.videoUrl) || ['finished', 'finished_waiting_video'].includes(match.status);
             return (
               <div
                 key={match.id}
