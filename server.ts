@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.20' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.21' });
 });
 
 console.log(
@@ -3350,7 +3350,7 @@ const identityPairCompatible = (
 
 const canonicalScore = (value: any): string | null => {
   const clean = String(value || '').trim();
-  const match = clean.match(/(?:^|\s)(\d{1,2})\s*[-xX×:]\s*(\d{1,2})(?:\s|$)/);
+  const match = clean.match(/(?:^|\s)(\d{1,2})\s*(?:[-xX×:]|[aA])\s*(\d{1,2})(?:\s|$)/);
   return match ? `${Number(match[1])} x ${Number(match[2])}` : null;
 };
 
@@ -3987,11 +3987,21 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     // A resposta principal já analisa o vídeo e normalmente contém estas
     // métricas. Um segundo passe só é permitido quando algo realmente faltou;
     // isso evita duplicar consumo de cota e gerar 429 desnecessariamente.
+    // No modo completo o passe focado é obrigatório. A resposta do passe
+    // principal pode trazer placeholders numericamente parseáveis que parecem
+    // completos aqui, mas são descartados pelo normalizador antes da tela.
+    // O passe de 15 minutos produz o formato quantitativo canônico usado pelo
+    // painel e não altera identidade, placar, jogadores ou demais análises.
     const needsTacticalCompletion = Boolean(
       useNativeYouTubeVideo &&
-      (analysisMode === 'complete' || process.env.GEMINI_ENABLE_TACTICAL_COMPLETION === 'true') &&
-      (!possessionComplete || !finishingComplete || !heatmapComplete ||
-        !defensiveComplete || !offensiveComplete)
+      (
+        analysisMode === 'complete' ||
+        (
+          process.env.GEMINI_ENABLE_TACTICAL_COMPLETION === 'true' &&
+          (!possessionComplete || !finishingComplete || !heatmapComplete ||
+            !defensiveComplete || !offensiveComplete)
+        )
+      )
     );
 
     if (needsTacticalCompletion) {

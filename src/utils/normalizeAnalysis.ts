@@ -101,15 +101,15 @@ export function sanitizeScore(rawScore: any): string {
   }
 
   // Strict regex for single score match: e.g. "2 x 1", "0 - 0", "3:2", "2x1"
-  const singleMatch = str.match(/^(\d{1,2})\s*[:xX\-–—]\s*(\d{1,2})$/);
+  const singleMatch = str.match(/^(\d{1,2})\s*(?:[:xX\-–—]|[aA])\s*(\d{1,2})$/);
   if (singleMatch) {
     return `${singleMatch[1]} x ${singleMatch[2]}`;
   }
   
   // Search within text for single clean score pattern
-  const matches = str.match(/\b(\d{1,2})\s*[:xX\-–—]\s*(\d{1,2})\b/g);
+  const matches = str.match(/\b(\d{1,2})\s*(?:[:xX\-–—]|[aA])\s*(\d{1,2})\b/g);
   if (matches && matches.length === 1) {
-    const parts = matches[0].match(/(\d{1,2})\s*[:xX\-–—]\s*(\d{1,2})/);
+    const parts = matches[0].match(/(\d{1,2})\s*(?:[:xX\-–—]|[aA])\s*(\d{1,2})/);
     if (parts) {
       return `${parts[1]} x ${parts[2]}`;
     }
@@ -117,7 +117,7 @@ export function sanitizeScore(rawScore: any): string {
 
   // If matches contains repeated sequences, pick the first valid pair
   if (matches && matches.length > 1) {
-    const firstPart = matches[0].match(/(\d{1,2})\s*[:xX\-–—]\s*(\d{1,2})/);
+    const firstPart = matches[0].match(/(\d{1,2})\s*(?:[:xX\-–—]|[aA])\s*(\d{1,2})/);
     if (firstPart) {
       return `${firstPart[1]} x ${firstPart[2]}`;
     }

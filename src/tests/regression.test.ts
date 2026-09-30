@@ -5,6 +5,12 @@ import { extractVideoId, teamsFromVideoTitle, parseClipRange } from '../utils/vi
 import { db, saveCompetition, saveMatch, getMatchById, saveTeam, listTeams, saveAnalysis, getAnalysisById, updateAnalysisVisibility, getPublicAnalysisById, saveTacticalBoard, listTacticalBoards, createUserWithPassword, createAuthSession, verifyAuthSessionToken } from '../db-sqlite.js';
 import { generateGeminiResilient, getGeminiRetryAfterSeconds } from '../../server.js';
 import { verifyVideo } from '../services/geminiService.js';
+import { sanitizeScore } from '../utils/normalizeAnalysis.js';
+
+test('Portuguese score separator is normalized', () => {
+  assert.equal(sanitizeScore('3 a 1'), '3 x 1');
+  assert.equal(sanitizeScore('3 A 1'), '3 x 1');
+});
 
 test('YouTube rejects lookalike hosts, arbitrary query URLs and invalid IDs', () => {
   for (const url of ['https://example.com/watch?v=dQw4w9WgXcQ', 'https://youtu.be.evil.test/dQw4w9WgXcQ', 'https://evil.test/embed/dQw4w9WgXcQ', 'https://youtube.com@evil.test/watch?v=dQw4w9WgXcQ', 'javascript:alert(1)']) assert.equal(extractVideoId(url), null, url);
@@ -105,7 +111,7 @@ test('HTTP smoke: health, login, authorization, ownership, invalid JSON and API 
   const id = createUserWithPassword(username,'HTTP test','HttpTestPassword123!');
   try {
     assert.equal((await request('/healthz')).status,200);
-    assert.equal((await (await request('/healthz')).json()).version,'6.10.20');
+    assert.equal((await (await request('/healthz')).json()).version,'6.10.21');
     assert.equal((await request('/api/analyses')).status,401);
     const login = await request('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password:'HttpTestPassword123!'})});
     assert.equal(login.status,200);
