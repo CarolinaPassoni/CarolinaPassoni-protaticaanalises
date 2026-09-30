@@ -105,7 +105,7 @@ test('HTTP smoke: health, login, authorization, ownership, invalid JSON and API 
   const id = createUserWithPassword(username,'HTTP test','HttpTestPassword123!');
   try {
     assert.equal((await request('/healthz')).status,200);
-    assert.equal((await (await request('/healthz')).json()).version,'6.10.19');
+    assert.equal((await (await request('/healthz')).json()).version,'6.10.20');
     assert.equal((await request('/api/analyses')).status,401);
     const login = await request('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password:'HttpTestPassword123!'})});
     assert.equal(login.status,200);

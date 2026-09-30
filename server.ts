@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.19' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.20' });
 });
 
 console.log(
@@ -3925,7 +3925,34 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     const metricPairComplete = (pair: any) =>
       metricValuePresent(pair?.timeA) && metricValuePresent(pair?.timeB);
 
-    const possessionComplete = metricPairComplete(parsed?.estatisticas?.posseDeBola);
+    const metricNumber = (value: any) =>
+      Number(String(value ?? '').replace('%', '').replace(',', '.').trim());
+
+    // O Gemini pode preencher campos sem evidência com 0/0. Isso não é uma
+    // posse válida: os dois percentuais precisam representar aproximadamente
+    // 100% do tempo observado e pelo menos um deles deve ser positivo.
+    const percentagePairComplete = (pair: any) => {
+      if (!metricPairComplete(pair)) return false;
+      const a = metricNumber(pair?.timeA);
+      const b = metricNumber(pair?.timeB);
+      return a >= 0 && b >= 0 && a <= 100 && b <= 100 &&
+        a + b >= 95 && a + b <= 105 && a + b > 0;
+    };
+
+    const heatmapTeamComplete = (team: any) => {
+      const values = [
+        team?.tercoDefensivo,
+        team?.tercoMedio,
+        team?.tercoOfensivo,
+      ];
+      if (!values.every(metricValuePresent)) return false;
+      const numbers = values.map(metricNumber);
+      const total = numbers.reduce((sum, value) => sum + value, 0);
+      return numbers.every(value => value >= 0 && value <= 100) &&
+        total >= 95 && total <= 105 && total > 0;
+    };
+
+    const possessionComplete = percentagePairComplete(parsed?.estatisticas?.posseDeBola);
 
     const finishingComplete = Boolean(
       metricPairComplete(parsed?.estatisticas?.finalizacoes) &&
@@ -3935,12 +3962,8 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     );
 
     const heatmapComplete = Boolean(
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo)
+      heatmapTeamComplete(parsed?.estatisticas?.mapaDeCalor?.timeA) &&
+      heatmapTeamComplete(parsed?.estatisticas?.mapaDeCalor?.timeB)
     );
 
     const defensiveComplete = Boolean(
@@ -4012,17 +4035,13 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     }
 
     const finalCoreMetricsComplete = Boolean(
-      metricPairComplete(parsed?.estatisticas?.posseDeBola) &&
+      percentagePairComplete(parsed?.estatisticas?.posseDeBola) &&
       metricPairComplete(parsed?.estatisticas?.finalizacoes) &&
       metricPairComplete(parsed?.estatisticas?.finalizacoesNoAlvo) &&
       metricPairComplete(parsed?.indicadoresAvancados?.xG) &&
       metricPairComplete(parsed?.indicadoresAvancados?.grandesChances) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoDefensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoMedio) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeA?.tercoOfensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoDefensivo) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoMedio) &&
-      metricValuePresent(parsed?.estatisticas?.mapaDeCalor?.timeB?.tercoOfensivo)
+      heatmapTeamComplete(parsed?.estatisticas?.mapaDeCalor?.timeA) &&
+      heatmapTeamComplete(parsed?.estatisticas?.mapaDeCalor?.timeB)
     );
 
     if (!finalCoreMetricsComplete) {
