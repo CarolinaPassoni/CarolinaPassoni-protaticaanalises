@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.16' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.17' });
 });
 
 console.log(
@@ -3398,13 +3398,17 @@ app.post('/api/analyze', requireAuth, requireActiveSubscription, requireAvailabl
   let startSec: number, endSec: number;
   try { ({ startSec, endSec } = parseClipRange(clipStartSeconds, clipEndSeconds)); }
   catch (error: any) { return res.status(400).json({ error: error.message }); }
-  if (endSec - startSec > 3600) {
+  const requestedMode = (mode === 'complete' || mode === 'detailed') ? mode : 'quick';
+  const maxClipSeconds = requestedMode === 'complete' ? 9000 : 3600;
+  if (endSec - startSec > maxClipSeconds) {
     return res.status(400).json({
-      error: 'Selecione um trecho de até 60 minutos. A análise do vídeo inteiro pode misturar abertura, intervalo e pós-jogo, gerando placar incorreto.',
+      error: requestedMode === 'complete'
+        ? 'A análise completa aceita transmissões de até 150 minutos.'
+        : 'Selecione um trecho de até 60 minutos ou escolha o modo Análise do jogo completo.',
       code: 'CLIP_TOO_LONG',
     });
   }
-  const analysisMode = (mode === 'complete' || mode === 'detailed') ? mode : 'quick';
+  const analysisMode = requestedMode;
 
   let verifiedContext: VerifiedVideoContext;
   let localVideoPath: string | undefined = req.file?.path;
