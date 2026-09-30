@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.15' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.16' });
 });
 
 console.log(
@@ -3398,6 +3398,12 @@ app.post('/api/analyze', requireAuth, requireActiveSubscription, requireAvailabl
   let startSec: number, endSec: number;
   try { ({ startSec, endSec } = parseClipRange(clipStartSeconds, clipEndSeconds)); }
   catch (error: any) { return res.status(400).json({ error: error.message }); }
+  if (endSec - startSec > 3600) {
+    return res.status(400).json({
+      error: 'Selecione um trecho de até 60 minutos. A análise do vídeo inteiro pode misturar abertura, intervalo e pós-jogo, gerando placar incorreto.',
+      code: 'CLIP_TOO_LONG',
+    });
+  }
   const analysisMode = (mode === 'complete' || mode === 'detailed') ? mode : 'quick';
 
   let verifiedContext: VerifiedVideoContext;
@@ -4033,21 +4039,28 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
 
     if (!parsed.placarAuditoria) parsed.placarAuditoria = {};
 
-    // Para uma análise de vídeo, o placar exibido no próprio conteúdo é a
-    // referência primária. Nunca deixe uma inferência ou pesquisa secundária
-    // substituir um placar visual válido.
-    if (visualScore) {
-      parsed.placar = visualScore;
-      parsed.placarAuditoria.placarVisivel = visualScore;
-      parsed.placarAuditoria.placarFinal = visualScore;
-      parsed.placarAuditoria.fontePlacar = 'Placar visível no vídeo analisado';
-
-      const officialCanonical = canonicalScore(officialScore);
-      if (officialCanonical && officialCanonical !== visualScore) {
+    // O placar visível em um recorte pode ser apenas o resultado intermediário.
+    // Só publicamos como placar final um resultado confirmado por fonte
+    // secundária. Sem confirmação, é mais seguro informar que não foi apurado.
+    const officialCanonical = canonicalScore(officialScore);
+    if (officialCanonical) {
+      parsed.placar = officialCanonical;
+      parsed.placarAuditoria.placarFinal = officialCanonical;
+      parsed.placarAuditoria.fontePlacar = 'Fonte secundária confirmada';
+      parsed.placarAuditoria.confianca = 'alta';
+      if (visualScore && visualScore !== officialCanonical) {
         parsed.placarAuditoria.observacoes =
-          `Conflito de fontes: o vídeo mostra ${visualScore}; a fonte secundária informou ${officialCanonical}. O relatório usa o placar do vídeo.`;
-        sectionValidation.score = 'partial';
+          `O trecho mostra ${visualScore}, um placar intermediário. O resultado final confirmado é ${officialCanonical}.`;
       }
+    } else {
+      parsed.placar = 'Não informado';
+      parsed.placarAuditoria.placarFinal = 'Não informado';
+      parsed.placarAuditoria.fontePlacar = 'Sem fonte final confirmada';
+      parsed.placarAuditoria.confianca = 'baixa';
+      parsed.placarAuditoria.observacoes = visualScore
+        ? `O trecho mostra ${visualScore}, mas esse valor não foi promovido a placar final sem confirmação externa.`
+        : 'Nenhum placar final foi confirmado com segurança.';
+      sectionValidation.score = 'unverified';
     }
 
     parsed.placarAuditoria.scoreEvidence = {

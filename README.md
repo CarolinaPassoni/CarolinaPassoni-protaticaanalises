@@ -1,4 +1,4 @@
-# ProTática Intelligence — 6.10.15
+# ProTática Intelligence — 6.10.16
 
 ## Executar e validar
 
@@ -28,4 +28,4 @@ SMTP, Stripe e Telegram dependem de suas respectivas variáveis já documentadas
 
 ## Revisão
 
-Veja `REVISAO_6.10.15.md` para correções, testes e limites da validação.
+Veja `REVISAO_6.10.16.md` para correções, testes e limites da validação.

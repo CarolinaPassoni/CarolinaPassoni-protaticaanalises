@@ -52,7 +52,7 @@ export const translations: TranslationDict = {
     submitAnalyze: { pt: 'Analisar Partida', en: 'Analyze Match', es: 'Analizar Partido' },
     submitAnalyzeFile: { pt: 'Analisar Arquivo', en: 'Analyze File', es: 'Analizar Archivo' },
     submitLoading: { pt: 'Analisando e validando...', en: 'Analyzing and auditing...', es: 'Analizando y auditando...' },
-    auditNote: { pt: 'O PROTÁTICA agora valida o placar com auditoria. Para maior fidelidade, escolha "Completa".', en: 'PROTACTICAL now validates the score with an audit. For maximum fidelity, select "Complete".', es: 'PROTÁCTICA ahora valida el marcador con auditoría. Para tener mayor fidelidad, elija "Completa".' },
+    auditNote: { pt: 'O PROTÁTICA valida o placar com auditoria. Placares intermediários do trecho não serão exibidos como resultado final.', en: 'PROTACTICAL audits the score. Intermediate scores from the segment will not be shown as the final result.', es: 'PROTÁCTICA audita el marcador. Los marcadores parciales no se mostrarán como resultado final.' },
 
     // History Panel
     historyTitle: { pt: 'Histórico de Análises', en: 'Analysis History', es: 'Historial de Análisis' },

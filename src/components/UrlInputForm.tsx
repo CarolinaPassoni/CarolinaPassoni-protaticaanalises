@@ -15,7 +15,7 @@ interface UrlInputFormProps {
     initialUrl?: string;
 }
 
-type ClipPreset = 'game15to30' | 'first5' | 'first15' | 'first30' | 'first45' | 'second45' | 'fullMatch' | 'custom';
+type ClipPreset = 'game15to30' | 'first5' | 'first15' | 'first30' | 'first45' | 'second45' | 'custom';
 
 const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initialUrl }) => {
     const { t, language } = useLanguage();
@@ -101,12 +101,6 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
             start: 2700, 
             end: 5400, 
             hint: language === 'pt' ? 'Mais demorado. Use quando quiser analisar a segunda etapa.' : language === 'en' ? 'Slower. Use when you want to analyze the second half.' : 'Más lento. Úselo para analizar el segundo tiempo.' 
-        },
-        fullMatch: { 
-            label: t('clipFull'), 
-            start: 0, 
-            end: 9000, 
-            hint: language === 'pt' ? 'Usa análise segmentada do vídeo inteiro. Tenta cobrir tempo normal, acréscimos, prorrogação e pênaltis.' : language === 'en' ? 'Uses segmented analysis of the full video. Covers normal, extra time and penalties.' : 'Usa análisis segmentado de todo el video. Cubre tiempo normal, prórroga y penales.' 
         },
     }), [t, language]);
 
@@ -250,14 +244,12 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
                                     onChange={(e) => {
                                         const nextMode = e.target.value as AnalysisMode;
                                         setMode(nextMode);
-                                        if (nextMode === 'complete') setClipPreset('fullMatch');
                                     }}
                                     disabled={isLoading}
                                     className="w-full bg-[#260101] border border-yellow-800/60 rounded-md px-3 py-2 text-yellow-101 outline-none focus:ring-2 focus:ring-yellow-500"
                                 >
                                     <option value="quick">{t('quickMode')}</option>
                                     <option value="detailed">{t('detailedMode')}</option>
-                                    <option value="complete">{t('completeMode')}</option>
                                 </select>
                                 <div className="mt-2 text-xs text-yellow-400/70 border-l-2 border-yellow-600/50 pl-2">
                                     {mode === 'complete' 
@@ -276,7 +268,6 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
                                     onChange={(e) => {
                                         const nextClip = e.target.value as ClipPreset;
                                         setClipPreset(nextClip);
-                                        if (nextClip === 'fullMatch') setMode('complete');
                                     }}
                                     disabled={isLoading}
                                     className="w-full bg-[#260101] border border-yellow-800/60 rounded-md px-3 py-2 text-yellow-101 outline-none focus:ring-2 focus:ring-yellow-500"
@@ -287,7 +278,6 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
                                     <option value="first30">{t('clipFirst30')}</option>
                                     <option value="first45">{t('clipFirst45')}</option>
                                     <option value="second45">{t('clipSecond45')}</option>
-                                    <option value="fullMatch">{t('clipFull')}</option>
                                     <option value="custom">{t('clipCustom')}</option>
                                 </select>
                                 <p className="mt-2 text-xs text-yellow-400/70">{selectedClip.hint}</p>
