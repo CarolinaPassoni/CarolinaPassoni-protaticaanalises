@@ -104,9 +104,9 @@ const UrlInputForm: React.FC<UrlInputFormProps> = ({ onSubmit, isLoading, initia
         },
         fullMatch: {
             label: t('clipFull'),
-            start: 0,
-            end: 9000,
-            hint: language === 'pt' ? 'Analisa a transmissão completa, incluindo os dois tempos, acréscimos, prorrogação e pênaltis quando existirem. O processamento pode levar mais tempo.' : language === 'en' ? 'Analyzes the full broadcast, including both halves, stoppage time, extra time and penalties when present. Processing may take longer.' : 'Analiza la transmisión completa, incluidos ambos tiempos, descuentos, prórroga y penales cuando existan. El procesamiento puede tardar más.'
+            start: 900,
+            end: 7200,
+            hint: language === 'pt' ? 'Analisa a faixa útil da transmissão, do minuto 15 ao 120, cobrindo os dois tempos e acréscimos sem incluir a abertura e o pós-jogo.' : language === 'en' ? 'Analyzes the useful broadcast window, from minute 15 to 120, covering both halves and stoppage time without the intro and post-match.' : 'Analiza la franja útil de la transmisión, del minuto 15 al 120, cubriendo ambos tiempos y descuentos sin la apertura ni el pospartido.'
         },
     }), [t, language]);
 
