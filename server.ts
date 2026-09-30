@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.18' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.19' });
 });
 
 console.log(
@@ -3965,15 +3965,22 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
     // métricas. Um segundo passe só é permitido quando algo realmente faltou;
     // isso evita duplicar consumo de cota e gerar 429 desnecessariamente.
     const needsTacticalCompletion = Boolean(
-      process.env.GEMINI_ENABLE_TACTICAL_COMPLETION === 'true' &&
       useNativeYouTubeVideo &&
+      (analysisMode === 'complete' || process.env.GEMINI_ENABLE_TACTICAL_COMPLETION === 'true') &&
       (!possessionComplete || !finishingComplete || !heatmapComplete ||
         !defensiveComplete || !offensiveComplete)
     );
 
     if (needsTacticalCompletion) {
+      // A análise completa cobre a transmissão inteira, mas o complemento de
+      // métricas usa uma amostra curta para contar eventos com precisão.
+      const completionStartSec = analysisMode === 'complete'
+        ? Math.min(startSec + 900, Math.max(startSec, endSec - 900))
+        : startSec;
+      const completionEndSec = Math.min(endSec, completionStartSec + 900);
+
       console.log(
-        `[TACTICAL_COMPLETION] start possession=${possessionComplete} finishing=${finishingComplete} heatmap=${heatmapComplete} defensive=${defensiveComplete} offensive=${offensiveComplete}`
+        `[TACTICAL_COMPLETION] start range=${completionStartSec}-${completionEndSec} possession=${possessionComplete} finishing=${finishingComplete} heatmap=${heatmapComplete} defensive=${defensiveComplete} offensive=${offensiveComplete}`
       );
 
       try {
@@ -3982,20 +3989,20 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
           videoUrl: verifiedContext.sourceUrl,
           timeA,
           timeB,
-          startSec,
-          endSec,
+          startSec: completionStartSec,
+          endSec: completionEndSec,
         });
 
         applySegmentMetricsToAnalysis(
           parsed,
           completion.data,
-          startSec,
-          endSec,
+          completionStartSec,
+          completionEndSec,
           completion.modelUsed
         );
 
         console.log(
-          `[TACTICAL_COMPLETION] success model=${completion.modelUsed} range=${startSec}-${endSec}`
+          `[TACTICAL_COMPLETION] success model=${completion.modelUsed} range=${completionStartSec}-${completionEndSec}`
         );
       } catch (completionErr: any) {
         console.warn(
@@ -4057,12 +4064,16 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
           `O trecho mostra ${visualScore}, um placar intermediário. O resultado final confirmado é ${officialCanonical}.`;
       }
     } else {
-      parsed.placar = 'Não informado';
-      parsed.placarAuditoria.placarFinal = 'Não informado';
-      parsed.placarAuditoria.fontePlacar = 'Sem fonte final confirmada';
+      // Preserve o placar realmente lido no vídeo quando a fonte externa não
+      // responder, mas identifique-o como evidência visual não confirmada.
+      parsed.placar = visualScore || 'Não informado';
+      parsed.placarAuditoria.placarFinal = visualScore ? 'Não confirmado' : 'Não informado';
+      parsed.placarAuditoria.fontePlacar = visualScore
+        ? 'Placar visível no vídeo'
+        : 'Sem fonte final confirmada';
       parsed.placarAuditoria.confianca = 'baixa';
       parsed.placarAuditoria.observacoes = visualScore
-        ? `O trecho mostra ${visualScore}, mas esse valor não foi promovido a placar final sem confirmação externa.`
+        ? `O vídeo mostra ${visualScore}. A fonte externa não respondeu, portanto este valor é exibido como placar visual e não como resultado final oficialmente confirmado.`
         : 'Nenhum placar final foi confirmado com segurança.';
       sectionValidation.score = 'unverified';
     }
