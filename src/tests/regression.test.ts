@@ -5,11 +5,47 @@ import { extractVideoId, teamsFromVideoTitle, parseClipRange } from '../utils/vi
 import { db, saveCompetition, saveMatch, getMatchById, saveTeam, listTeams, saveAnalysis, getAnalysisById, updateAnalysisVisibility, getPublicAnalysisById, saveTacticalBoard, listTacticalBoards, createUserWithPassword, createAuthSession, verifyAuthSessionToken } from '../db-sqlite.js';
 import { generateGeminiResilient, getGeminiRetryAfterSeconds } from '../../server.js';
 import { verifyVideo } from '../services/geminiService.js';
-import { sanitizeScore } from '../utils/normalizeAnalysis.js';
+import { sanitizeScore, hasValue, normalizeAnalysisResponse } from '../utils/normalizeAnalysis.js';
 
 test('Portuguese score separator is normalized', () => {
   assert.equal(sanitizeScore('3 a 1'), '3 x 1');
   assert.equal(sanitizeScore('3 A 1'), '3 x 1');
+});
+
+test('Normalizer preserves valid metrics and metric audit metadata', () => {
+  for (const value of ['55%', '8', '0.82', 'Bloco médio-alto']) {
+    assert.equal(hasValue(value), true, value);
+  }
+  for (const value of ['', 'Não disponível', 'N/D', '—']) {
+    assert.equal(hasValue(value), false, value);
+  }
+
+  const normalized = normalizeAnalysisResponse({
+    timeA: 'A',
+    timeB: 'B',
+    placar: '3 a 1',
+    estatisticas: {
+      posseDeBola: { timeA: '55%', timeB: '45%' },
+      finalizacoes: { timeA: '8', timeB: '5' },
+      finalizacoesNoAlvo: { timeA: '4', timeB: '2' },
+      mapaDeCalor: {
+        timeA: { tercoDefensivo: '25%', tercoMedio: '45%', tercoOfensivo: '30%' },
+        timeB: { tercoDefensivo: '40%', tercoMedio: '40%', tercoOfensivo: '20%' },
+      },
+    },
+    indicadoresAvancados: {
+      xG: { timeA: '0.82', timeB: '0.41' },
+      grandesChances: { timeA: '2', timeB: '1' },
+    },
+    verificacaoAuditoria: {
+      metricasOrigem: 'estimativa_visual_trecho',
+      metricasTrecho: '1800s - 2700s',
+    },
+  });
+
+  assert.equal(normalized.estatisticas?.posseDeBola?.timeA, '55%');
+  assert.equal(normalized.indicadoresAvancados?.xG?.timeA, '0.82');
+  assert.equal((normalized.verificacaoAuditoria as any)?.metricasOrigem, 'estimativa_visual_trecho');
 });
 
 test('YouTube rejects lookalike hosts, arbitrary query URLs and invalid IDs', () => {
@@ -111,7 +147,7 @@ test('HTTP smoke: health, login, authorization, ownership, invalid JSON and API 
   const id = createUserWithPassword(username,'HTTP test','HttpTestPassword123!');
   try {
     assert.equal((await request('/healthz')).status,200);
-    assert.equal((await (await request('/healthz')).json()).version,'6.10.21');
+    assert.equal((await (await request('/healthz')).json()).version,'6.10.22');
     assert.equal((await request('/api/analyses')).status,401);
     const login = await request('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password:'HttpTestPassword123!'})});
     assert.equal(login.status,200);

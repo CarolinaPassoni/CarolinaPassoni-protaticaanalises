@@ -15,7 +15,6 @@ export function parseOptionalNumber(val: any): number | null {
  * Checks if a metric string contains valid data (not empty, not purely whitespace).
  */
 const INVALID_METRIC_TOKENS = [
-  '',
   '—',
   '-',
   'n/d',
@@ -45,9 +44,20 @@ export function hasValue(val: any): boolean {
   const normalized = normalizeComparableText(val);
   if (!normalized) return false;
 
-  return !INVALID_METRIC_TOKENS.some((token) =>
-    normalized === token || normalized.includes(token)
-  );
+  // Tokens curtos são comparados por igualdade. Procurá-los com `includes`
+  // invalidava conteúdo legítimo; pior: o antigo token vazio fazia qualquer
+  // número ou texto ser rejeitado porque toda string contém "".
+  const invalidPhrases = [
+    'nao disponivel',
+    'indisponivel',
+    'nao identificado',
+    'sem dados',
+    'sem informacao',
+    'nao encontrado',
+  ];
+
+  return !INVALID_METRIC_TOKENS.some((token) => normalized === token) &&
+    !invalidPhrases.some((phrase) => normalized.includes(phrase));
 }
 
 /**
@@ -426,6 +436,7 @@ export function normalizeAnalysisResponse(raw: any): Analysis {
   // Verification and audit
   const rawVer = raw.verificacaoAuditoria || {};
   const verificacaoAuditoria = {
+    ...rawVer,
     partidaIdentificada: rawVer.partidaIdentificada || `${timeA} x ${timeB}`,
     trechoAnalisado: rawVer.trechoAnalisado || undefined,
     modeloUsado: rawVer.modeloUsado || 'gemini-3.7-flash',

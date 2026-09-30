@@ -886,7 +886,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Render/hosting health check. Keep this route independent from AI, SMTP and billing.
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.21' });
+  res.status(200).json({ status: 'ok', service: 'protatica', version: '6.10.22' });
 });
 
 console.log(
@@ -3901,6 +3901,14 @@ DIRETRIZES FUNDAMENTAIS PARA AS SEÇÕES DA ANÁLISE:
       swapped: identityMatch.swapped,
       evidence: String(parsed.identidadeVideo?.evidencia || '').trim(),
     };
+
+    // Não apresentar uma lista parcial inferida como se fosse escalação.
+    // Sem pelo menos sete nomes confirmados por equipe na fonte secundária,
+    // preservamos apenas esquema/destaques visuais e ocultamos "titulares".
+    if (!isLineupConfirmed && parsed.formacoes) {
+      if (parsed.formacoes.timeA) delete parsed.formacoes.timeA.titulares;
+      if (parsed.formacoes.timeB) delete parsed.formacoes.timeB.titulares;
+    }
 
     if (!parsed.verificacaoAuditoria) parsed.verificacaoAuditoria = {};
     if (useNativeYouTubeVideo) {
